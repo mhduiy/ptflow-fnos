@@ -1,0 +1,4 @@
+#!/bin/bash
+set -euo pipefail
+: "${TRIM_APPDEST:?Missing TRIM_APPDEST}"
+exec "$TRIM_APPDEST/python/bin/python3" -I "$TRIM_APPDEST/lifecycle.py" "${1:-}"

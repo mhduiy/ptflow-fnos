@@ -1,0 +1,531 @@
+"""Persisted ownership and conservative, restart-safe brush decisions."""
+
+from datetime import datetime
+import math
+import time
+from zoneinfo import ZoneInfo
+
+from .integrations import IntegrationError, MTeam, QBittorrent, select_files, torrent_metadata
+
+GIB = 1024 ** 3
+MIB = 1024 ** 2
+STOPPED = {"pausedDL", "pausedUP", "stoppedDL", "stoppedUP"}
+
+
+def result(status, message, **counts):
+    return {"status": status, "message": message, "counts": counts}
+
+
+def candidate(item, mode, now):
+    if not isinstance(item, dict) or not isinstance(item.get("status"), dict):
+        raise ValueError("种子项或 status 不是对象")
+    status = item["status"]
+    mall = status.get("mallSingleFree")
+    mall = mall if isinstance(mall, dict) else {}
+    if status.get("discount") in ("FREE", "_2X_FREE"):
+        expiry = status.get("discountEndTime") or (mall.get("endDate") if mall.get("status") == "ONGOING" else None)
+    elif mall.get("status") == "ONGOING":
+        expiry = mall.get("endDate")
+    else:
+        raise ValueError("不满足 Free 规则")
+    if not isinstance(expiry, str) or not expiry:
+        raise ValueError("Free 结束时间缺失")
+    try:
+        end = datetime.fromisoformat(expiry.replace("Z", "+00:00"))
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=ZoneInfo("Asia/Shanghai"))
+        free_until = end.timestamp()
+    except (ValueError, OverflowError):
+        raise ValueError("Free 结束时间无法解析") from None
+    if free_until <= now:
+        raise ValueError("Free 已结束")
+    identity = str(item.get("id", ""))
+    name = item.get("name")
+    if not identity.isascii() or not identity.isdigit() or len(identity) > 30 or not isinstance(name, str) or not name.strip():
+        raise ValueError("种子 ID 或名称无效")
+    try:
+        values = (item["size"], status["seeders"], status["leechers"])
+        if any(type(v) is not int and not (isinstance(v, str) and v.isascii() and v.isdigit() and len(v) <= 19) for v in values):
+            raise ValueError
+        size, seeders, leechers = int(item["size"]), int(status["seeders"]), int(status["leechers"])
+    except (KeyError, ValueError, TypeError, OverflowError):
+        raise ValueError("种子大小或人数无效") from None
+    if not 0 < size <= 2**63 - 1 or not 0 <= seeders <= 2**31 - 1 or not 0 <= leechers <= 2**31 - 1:
+        raise ValueError("种子大小或人数越界")
+    score = (leechers / math.sqrt(seeders + 1) * math.log(max(1, size // MIB))
+             * math.log(seeders + 1)) if seeders and leechers else 0
+    return {"id": identity, "name": name, "size": size, "seeders": seeders,
+            "leechers": leechers, "free_until": free_until, "score": score,
+            "mode": mode, "state": "pending", "reason": ""}
+
+
+def owned(rows, candidates):
+    confirmed = {str(c["qb_hash"]).lower(): c for c in candidates
+                 if c.get("state") == "submitted" and c.get("qb_hash")}
+    return [(row, confirmed[str(row["hash"]).lower()]) for row in rows
+            if row.get("category") == "ptflow" and str(row["hash"]).lower() in confirmed]
+
+
+def matching(rows, expected, identity):
+    for row in rows:
+        tags = {tag.strip() for tag in str(row.get("tags", "")).split(",")}
+        if (str(row["hash"]).lower() == expected.lower() and row.get("category") == "ptflow"
+                and f"ptflow-id-{identity}" in tags):
+            return row
+    return None
+
+
+class Engine:
+    def __init__(self, config, store, progress):
+        self.config, self.store, self.progress = config, store, progress
+        self.strategy = config["strategy"]
+
+    def _event(self, level, stage, message, details=None):
+        safe = self.store.redact(message)
+        self.progress(stage, safe)
+        self.store.event(level, stage, safe, details=details)
+
+    def _qb(self):
+        return QBittorrent(self.config["downloader"], self._event)
+
+    def _mt(self):
+        return MTeam(self.config["mteam"], self._event)
+
+    def _reason(self, identity, message, *, state=None):
+        safe = self.store.redact(str(message))
+        self.store.update_candidate(identity, reason=safe, **({"state": state} if state else {}))
+        self._event("WARNING", "candidate", safe, {"id": identity, "state": state or "unchanged"})
+
+    def query(self):
+        self._event("INFO", "query", "串行查询 Free 候选；入库不等于提交下载器")
+        mt = self._mt()
+        settings = self.config["mteam"]
+        counts = {"returned": 0, "persisted": 0, "skipped": 0, "failed": 0}
+        try:
+            modes = settings["modes"]
+            if not modes:
+                return result("skipped", "没有启用查询分类", **counts)
+            for index, mode in enumerate(modes):
+                if index:
+                    delay = settings["request_interval_seconds"]
+                    self._event("INFO", "query.wait", "主动请求间隔；不是 HTTP 限流", {"seconds": delay, "next_mode": mode})
+                    time.sleep(delay)
+                self._event("INFO", "query.mode", "开始查询分类", {"mode": mode, "page_size": settings["page_size"]})
+                try:
+                    rows = mt.search(mode, settings["page_size"])
+                except IntegrationError as error:
+                    counts["failed"] += 1
+                    self._event("ERROR", "query.mode", str(error), {"mode": mode, "http_status": error.status})
+                    continue
+                counts["returned"] += len(rows)
+                for item in rows:
+                    try:
+                        row = candidate(item, mode, time.time())
+                    except (ValueError, TypeError) as error:
+                        counts["skipped"] += 1
+                        self._event("INFO", "query.filter", str(error), {
+                            "mode": mode, "id": item.get("id") if isinstance(item, dict) else None,
+                        })
+                        continue
+                    self.store.upsert_candidate(row)
+                    counts["persisted"] += 1
+                    self._event("INFO", "query.persist", "Free 候选已入库；尚未提交 QB", {
+                        "id": row["id"], "name": row["name"], "size": row["size"],
+                        "seeders": row["seeders"], "leechers": row["leechers"],
+                        "score": row["score"], "free_until": row["free_until"], "mode": mode,
+                    })
+            status = "partial" if counts["failed"] and counts["persisted"] else "failed" if counts["failed"] else "succeeded"
+            message = f"查询完成：入库/更新 {counts['persisted']} 项，跳过 {counts['skipped']} 项，失败分类 {counts['failed']}；未提交 QB"
+            self._event("INFO", "query", message, counts)
+            return result(status, message, **counts)
+        finally:
+            mt.close()
+
+    def _observe(self, rows):
+        now = time.time()
+        for row, record in owned(rows, self.store.candidates(limit=100000)):
+            previous = float(record.get("last_activity") or record.get("submitted_at") or now)
+            activity = row.get("last_activity", 0)
+            activity = activity if isinstance(activity, (int, float)) and 0 < activity <= now else 0
+            if row.get("upspeed", 0) > 0 or row.get("dlspeed", 0) > 0:
+                activity = now
+            self.store.update_candidate(record["id"], last_activity=max(previous, activity))
+
+    def _sample(self, qb):
+        sample = qb.sample()
+        sample["time"] = time.time()
+        self.store.sample(sample)
+        self._event("INFO", "collect", "记录下载器全局真实采样（不是 PTFlow 独占流量）", sample)
+        return sample
+
+    def _expire(self, qb, rows):
+        count, failed = 0, 0
+        horizon = time.time() + self.strategy["min_free_hours"] * 3600
+        for row, record in owned(rows, self.store.candidates(limit=100000)):
+            if record["free_until"] > horizon:
+                continue
+            torrent_hash = row["hash"]
+            try:
+                files = qb.files(torrent_hash)
+                incomplete = [f["index"] for f in files if f.get("progress", 0) < 1 and f["priority"] != 0]
+                if not incomplete:
+                    continue
+                # Stop first; then forbid every unfinished file, preserving completed files/data.
+                qb.stop(torrent_hash)
+                qb.priority(torrent_hash, incomplete, 0)
+                after = qb.files(torrent_hash)
+                if any(f.get("progress", 0) < 1 and f["priority"] != 0 for f in after):
+                    raise IntegrationError("临近 Free 结束：文件优先级未生效，保持停止")
+                qb.start(torrent_hash)
+                self.store.update_candidate(record["id"], reason="Free 窗口不足：停止所有未完成文件下载，保留数据供做种")
+                self._event("INFO", "free.protect", "已禁用未完成文件下载；保留种子和已下载数据做种", {
+                    "id": record["id"], "hash": torrent_hash, "files_disabled": len(incomplete),
+                    "free_until": record["free_until"],
+                })
+                count += 1
+            except IntegrationError as error:
+                failed += 1
+                self._reason(record["id"], str(error))
+        return count, failed
+
+    def collect(self):
+        self._event("INFO", "collect", "开始采集真实下载器状态")
+        qb = self._qb()
+        try:
+            self._sample(qb)
+            rows = qb.torrents()
+            self._observe(rows)
+            protected, failed = self._expire(qb, rows)
+            return result("partial" if failed else "succeeded", "下载器全局采样已更新", sampled=1,
+                          managed=len(owned(rows, self.store.candidates(limit=100000))), protected=protected, failed=failed)
+        finally:
+            qb.close()
+
+    def torrents(self):
+        qb = self._qb()
+        try:
+            rows = qb.torrents()
+            self._observe(rows)
+            items = []
+            for row, record in owned(rows, self.store.candidates(limit=100000)):
+                items.append({
+                    "hash": row["hash"], "id": record["id"], "name": row.get("name", record["name"]),
+                    "size": row.get("size", record["size"]), "progress": min(1, max(0, row.get("progress", 0))),
+                    "state": row.get("state", "unknown"), "upspeed": row.get("upspeed", 0),
+                    "dlspeed": row.get("dlspeed", 0), "uploaded": row.get("uploaded", 0),
+                    "downloaded": row.get("downloaded", 0), "ratio": row.get("ratio", 0),
+                    "free_until": record["free_until"], "added_on": row.get("added_on", record.get("submitted_at", 0)),
+                })
+            return items
+        finally:
+            qb.close()
+
+    def _confirm(self, qb, record):
+        row = matching(qb.torrents(), record["qb_hash"], record["id"])
+        if row is None:
+            self._reason(record["id"], "QB 添加结果未确认：等待实际哈希和所有权标签出现；不重复添加", state="uncertain")
+            return None
+        self.store.update_candidate(record["id"], state="submitted", qb_hash=row["hash"].lower(),
+                                    submitted_at=record.get("submitted_at") or time.time(),
+                                    last_activity=time.time(), reason="待准备：实际哈希已确认；尚未确认下载启动")
+        self._event("INFO", "qb.confirm", "实际 QB 哈希和分类/标签已确认，持久化所有权", {
+            "id": record["id"], "hash": row["hash"], "state": row.get("state"),
+        })
+        if row.get("state") not in STOPPED or row.get("dlspeed", 0) > 0:
+            qb.stop(row["hash"])
+            row = matching(qb.torrents(), row["hash"], record["id"])
+            if row is None or row.get("state") not in STOPPED or row.get("dlspeed", 0) > 0:
+                raise IntegrationError("已确认的添加任务未能停止；保留所有权，不启动未核验的文件")
+        return row
+
+    def _prepare(self, qb, row, record, budget):
+        torrent_hash = row["hash"]
+        if row.get("state") not in STOPPED or row.get("dlspeed", 0) > 0:
+            qb.stop(torrent_hash)
+            stopped = matching(qb.torrents(), torrent_hash, record["id"])
+            if not stopped or stopped.get("state") not in STOPPED or stopped.get("dlspeed", 0) > 0:
+                raise IntegrationError("QB 停止状态未确认，禁止准备或启动文件")
+        files = qb.files(torrent_hash)
+        selected, size = select_files(files, budget)
+        if not selected:
+            qb.priority(torrent_hash, [f["index"] for f in files], 0)
+            self._reason(record["id"], "预算无法容纳任何完整文件：保持停止，不下载不需要的数据")
+            return 0
+        # No downloading can start until both priority calls and read-back succeed.
+        qb.priority(torrent_hash, [f["index"] for f in files if f["index"] not in selected], 0)
+        qb.priority(torrent_hash, selected, 1)
+        after = qb.files(torrent_hash)
+        actual = {f["index"] for f in after if f["priority"] != 0}
+        if actual != set(selected) or sum(f["size"] for f in after if f["priority"] != 0) > budget:
+            raise IntegrationError("文件预算校验失败：保持停止，未启动下载")
+        if record["free_until"] <= time.time() + self.strategy["min_free_hours"] * 3600:
+            self._reason(record["id"], "准备文件期间 Free 窗口不足：保持停止")
+            return 0
+        qb.start(torrent_hash)
+        actual_row = matching(qb.torrents(), torrent_hash, record["id"])
+        state = actual_row.get("state") if actual_row else "未确认"
+        self.store.update_candidate(record["id"], reason=f"已核验完整文件预算并请求启动；实际 QB 状态：{state}")
+        self._event("INFO", "qb.start", "完整文件预算已核验；启动接口成功不等于正在下载", {
+            "id": record["id"], "hash": torrent_hash, "selected_files": len(selected),
+            "selected_bytes": size, "budget_bytes": budget, "state": state,
+        })
+        return size
+
+    def _gate(self, sample, rows):
+        settings = self.strategy
+        history = self.store.history(minutes=settings["speed_window_minutes"])
+        fresh_age = max(60, self.config["schedule"]["stats_seconds"] * 2)
+        now = time.time()
+        history = [s for s in history if now - settings["speed_window_minutes"] * 60 <= s["time"] <= now]
+        latest = self.store.latest_sample()
+        if not latest or not history or now - latest["time"] > fresh_age:
+            return "缺少新鲜下载器采样，不新增", 0, 0
+        reserve = int(settings["min_free_gib"] * GIB)
+        budget = max(0, sample["free_space"] - reserve)
+        peak = max(s["dlspeed"] for s in history)
+        average = sum(s["upspeed"] for s in history) / len(history)
+        # Count global incomplete running/queued tasks, including seeds outside our ownership.
+        downloading = sum(1 for row in rows if row.get("progress", 0) < 1 and row.get("state") not in STOPPED)
+        slots = max(0, settings["max_downloading"] - downloading)
+        self._event("INFO", "brush.limits", "本地磁盘、速度、并发保护判定；不是站点 HTTP 限流", {
+            "free_space": sample["free_space"], "reserve": reserve, "budget": budget,
+            "peak_download": peak, "download_limit": settings["max_download_mib"] * MIB,
+            "average_upload": average, "upload_target": settings["target_upload_mib"] * MIB,
+            "window_minutes": settings["speed_window_minutes"], "samples": len(history),
+            "sample_age_seconds": now - latest["time"], "downloading": downloading, "slots": slots,
+        })
+        if not budget:
+            return "磁盘剩余不足保留阈值，不新增", slots, budget
+        if peak > settings["max_download_mib"] * MIB:
+            return "窗口内下载峰值超过限制，不新增", slots, budget
+        if average > settings["target_upload_mib"] * MIB:
+            return "窗口内平均上传达到目标，不新增", slots, budget
+        if not slots:
+            return "同时下载任务达到上限，不新增", slots, budget
+        return None, slots, budget
+
+    def brush(self):
+        self._event("INFO", "brush", "读取真实 QB 状态，先核对不确定添加结果，再检查保护")
+        qb = self._qb()
+        mt = None
+        counts = {"submitted": 0, "started": 0, "reconciled": 0, "uncertain": 0, "failed": 0, "skipped": 0}
+        try:
+            sample = self._sample(qb)
+            rows = qb.torrents()
+            self._observe(rows)
+            self._expire(qb, rows)
+            recovered = []
+            for record in self.store.candidates(limit=100000):
+                if record["state"] != "uncertain":
+                    continue
+                if not record.get("qb_hash"):
+                    self._reason(record["id"], "不确定记录缺少预期哈希：禁止重发添加请求")
+                    counts["uncertain"] += 1
+                    continue
+                confirmed = self._confirm(qb, record)
+                if confirmed:
+                    counts["reconciled"] += 1
+                    recovered.append((confirmed, record))
+                else:
+                    counts["uncertain"] += 1
+            rows = qb.torrents()
+            recovered.extend((row, record) for row, record in owned(rows, self.store.candidates(limit=100000))
+                             if record.get("reason", "").startswith("待准备：")
+                             and record["id"] not in {r["id"] for _, r in recovered})
+            for row, record in recovered:
+                if row.get("state") not in STOPPED or row.get("dlspeed", 0) > 0:
+                    qb.stop(row["hash"])
+            rows = qb.torrents()
+            reason, slots, disk_budget = self._gate(sample, rows)
+            if reason:
+                self._event("WARNING", "brush.limits", reason)
+                return result("partial" if counts["uncertain"] else "skipped", reason, **counts)
+            max_budget = int(self.strategy["max_torrent_gib"] * GIB)
+            # Reserve absent ambiguous acceptances; late QB visibility must not overfill slots/disk.
+            slots = max(0, slots - counts["uncertain"])
+            disk_budget = max(0, disk_budget - counts["uncertain"] * max_budget)
+            for row, record in recovered:
+                if not slots:
+                    break
+                if record["free_until"] <= time.time() + self.strategy["min_free_hours"] * 3600:
+                    self._expire(qb, [row])
+                    continue
+                try:
+                    size = self._prepare(qb, row, record, min(max_budget, disk_budget))
+                    if size:
+                        slots -= 1
+                        disk_budget -= size
+                        counts["started"] += 1
+                except IntegrationError as error:
+                    counts["failed"] += 1
+                    self._reason(record["id"], "待准备：" + str(error))
+            pending = [c for c in self.store.candidates(limit=100000) if c["state"] in ("pending", "failed")]
+            pending.sort(key=lambda c: (-c["score"], c["id"]))
+            for record in pending:
+                if not slots or disk_budget <= 0:
+                    break
+                identity = record["id"]
+                if record["free_until"] <= time.time() + self.strategy["min_free_hours"] * 3600:
+                    counts["skipped"] += 1
+                    self._reason(identity, "Free 剩余时间不足最低下载窗口")
+                    continue
+                if record["seeders"] < self.strategy["min_seeders"] or record["leechers"] < self.strategy["min_leechers"]:
+                    counts["skipped"] += 1
+                    self._reason(identity, "做种数或下载数低于策略要求")
+                    continue
+                attempted = False
+                add_returned = False
+                try:
+                    if mt is None:
+                        mt = self._mt()
+                    self._event("INFO", "brush.candidate", "按评分处理候选：先取凭证和种子，再向 QB 添加", {
+                        "id": identity, "score": record["score"], "size": record["size"],
+                    })
+                    content = mt.torrent(identity)
+                    metadata = torrent_metadata(content)
+                    expected = metadata["hash"]
+                    budget = min(max_budget, disk_budget)
+                    if not any(0 < size <= budget for size in metadata["lengths"]):
+                        counts["skipped"] += 1
+                        self._reason(identity, "种子预算无法容纳一个完整文件；未向 QB 添加")
+                        continue
+                    rows = qb.torrents()
+                    persisted = self.store.candidates(limit=100000)
+                    if (any(str(row["hash"]).lower() == expected for row in rows)
+                            or any(c.get("qb_hash") == expected and c["state"] in ("submitted", "uncertain") for c in persisted)):
+                        counts["skipped"] += 1
+                        self._reason(identity, "实际哈希已存在或等待确认：不重复添加，也不接管手工种子")
+                        continue
+                    fresh_reason, fresh_slots, fresh_budget = self._gate(self._sample(qb), rows)
+                    if fresh_reason:
+                        self._reason(identity, fresh_reason + "；保护在实际添加前重新检查")
+                        counts["skipped"] += 1
+                        break
+                    slots = min(slots, fresh_slots)
+                    disk_budget = min(disk_budget, fresh_budget)
+                    budget = min(max_budget, disk_budget)
+                    if not slots or not any(0 < size <= budget for size in metadata["lengths"]):
+                        self._reason(identity, "添加前预算/并发重新检查未通过；未向 QB 添加")
+                        counts["skipped"] += 1
+                        break
+                    if record["free_until"] <= time.time() + self.strategy["min_free_hours"] * 3600:
+                        self._reason(identity, "下载种子期间 Free 窗口不足；未向 QB 添加")
+                        counts["skipped"] += 1
+                        continue
+                    qb.category()
+                    self.store.update_candidate(identity, state="uncertain", qb_hash=expected,
+                                                reason="添加请求待核验：预期哈希已持久化，禁止重复请求")
+                    record = {**record, "qb_hash": expected}
+                    attempted = True
+                    slots -= 1
+                    disk_budget -= budget
+                    outcome = qb.add(content, identity, self.config["downloader"].get("save_path", ""))
+                    add_returned = True
+                    if outcome == "rejected":
+                        counts["failed"] += 1
+                        slots += 1
+                        disk_budget += budget
+                        self.store.update_candidate(identity, state="failed", qb_hash="", reason="QB 添加接口明确拒绝；未提交")
+                        continue
+                    row = self._confirm(qb, record)
+                    if row is None:
+                        counts["uncertain"] += 1
+                        continue
+                    counts["submitted"] += 1
+                    size = self._prepare(qb, row, record, budget)
+                    if size:
+                        counts["started"] += 1
+                        disk_budget += budget - size
+                    else:
+                        counts["skipped"] += 1
+                        slots += 1
+                        disk_budget += budget
+                except IntegrationError as error:
+                    counts["failed"] += 1
+                    if attempted:
+                        # Once confirmed, preserve ownership even if file setup/start fails.
+                        current = next(c for c in self.store.candidates(limit=100000) if c["id"] == identity)
+                        if current["state"] == "submitted":
+                            self._reason(identity, "待准备：" + str(error))
+                        elif add_returned or error.ambiguous or error.status is None:
+                            counts["uncertain"] += 1
+                            self._reason(identity, str(error) + "；结果不确定，保留哈希等待核对，不重发", state="uncertain")
+                        else:
+                            slots += 1
+                            disk_budget += budget
+                            self.store.update_candidate(identity, state="failed", qb_hash="", reason=self.store.redact(str(error)))
+                    else:
+                        self._reason(identity, str(error) + "；尚未向 QB 添加，继续处理其他候选", state="failed")
+                    self._event("ERROR", "brush.candidate", str(error), {"id": identity, "http_status": error.status, "add_attempted": attempted})
+            status = "partial" if counts["uncertain"] or (counts["failed"] and (counts["submitted"] or counts["reconciled"])) else "failed" if counts["failed"] else "succeeded" if counts["submitted"] or counts["reconciled"] else "skipped"
+            message = f"实际哈希确认 {counts['submitted']} 项，核对恢复 {counts['reconciled']} 项，启动请求 {counts['started']} 项，不确定 {counts['uncertain']} 项，失败 {counts['failed']} 项"
+            self._event("INFO", "brush", message, counts)
+            return result(status, message, **counts)
+        finally:
+            qb.close()
+            if mt is not None:
+                mt.close()
+
+    def cleanup(self):
+        self._event("INFO", "cleanup", "检查已确认所有权；Free 保护不删除数据")
+        qb = self._qb()
+        counts = {"protected": 0, "deleted": 0, "failed": 0, "skipped": 0}
+        try:
+            rows = qb.torrents()
+            self._observe(rows)
+            counts["protected"], counts["failed"] = self._expire(qb, rows)
+            if not self.strategy["cleanup_enabled"]:
+                return result("partial" if counts["failed"] else "succeeded" if counts["protected"] else "skipped",
+                              "闲置清理未启用；Free 下载保护仍生效，保留全部数据", **counts)
+            for row, record in owned(qb.torrents(), self.store.candidates(limit=100000)):
+                now = time.time()
+                activity = record.get("last_activity") or now
+                added = max(record.get("submitted_at") or now, row.get("added_on") or 0)
+                completion = row.get("completion_on", 0)
+                if completion > 0:
+                    added = max(added, completion)
+                if (row.get("upspeed", 0) > 0 or row.get("dlspeed", 0) > 0
+                        or row.get("state") not in STOPPED | {"stalledUP", "stalledDL", "queuedUP", "queuedDL"}
+                        or now - activity < self.strategy["idle_minutes"] * 60
+                        or now - added < self.strategy["protect_seed_hours"] * 3600):
+                    counts["skipped"] += 1
+                    continue
+                try:
+                    qb.delete(row["hash"], self.strategy["delete_files"])
+                    if any(r["hash"].lower() == row["hash"].lower() for r in qb.torrents()):
+                        self._reason(record["id"], "清理接口成功但种子仍存在；未标记已删除")
+                        counts["failed"] += 1
+                        continue
+                    self.store.update_candidate(record["id"], state="removed", reason="已核实 QB 种子移除；" + ("请求同时删除文件" if self.strategy["delete_files"] else "保留下载文件"))
+                    counts["deleted"] += 1
+                    self._event("INFO", "cleanup.delete", "已核实种子从 QB 消失", {
+                        "id": record["id"], "hash": row["hash"], "delete_files": self.strategy["delete_files"],
+                        "idle_seconds": now - activity, "protected_age_seconds": now - added,
+                    })
+                except IntegrationError as error:
+                    counts["failed"] += 1
+                    self._reason(record["id"], str(error) + "；清理结果未确认，保留所有权记录")
+            return result("partial" if counts["failed"] else "succeeded", f"确认移除 {counts['deleted']} 项；Free 保护 {counts['protected']} 项", **counts)
+        finally:
+            qb.close()
+
+    def test_connection(self, target):
+        if target == "downloader":
+            qb = self._qb()
+            try:
+                qb.sample()
+                qb.torrents()
+                return {"ok": True, "message": "qBittorrent 认证、全局统计和种子列表读取成功", "version": qb.version}
+            finally:
+                qb.close()
+        if target == "mteam":
+            mt = self._mt()
+            try:
+                modes = self.config["mteam"]["modes"]
+                if not modes:
+                    raise IntegrationError("M-Team 至少需要启用一个查询分类")
+                rows = mt.search(modes[0], 1)
+                return {"ok": True, "message": "M-Team API 认证及真实查询成功", "returned": len(rows)}
+            finally:
+                mt.close()
+        raise IntegrationError("未知连接测试目标")

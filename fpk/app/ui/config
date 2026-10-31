@@ -1,0 +1,15 @@
+{
+  ".url": {
+    "ptflow-fnos.main": {
+      "title": "PTFlow",
+      "icon": "images/icon_{0}.png",
+      "type": "iframe",
+      "protocol": "",
+      "gatewayPrefix": "/app/ptflow-fnos",
+      "gatewaySocket": "app.sock",
+      "url": "/app/ptflow-fnos/",
+      "allUsers": false,
+      "control": {"accessPerm": "readonly"}
+    }
+  }
+}

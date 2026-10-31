@@ -1,0 +1,18 @@
+[
+  {
+    "stepTitle": "卸载 PTFlow",
+    "items": [
+      {
+        "type": "radio",
+        "field": "wizard_delete_data",
+        "label": "应用数据处理方式（不操作 qBittorrent 中的种子或文件）",
+        "initValue": "false",
+        "options": [
+          {"label": "仅卸载应用，保留配置、密码、数据库与日志", "value": "false"},
+          {"label": "删除 PTFlow 应用数据（不可恢复，请先备份）", "value": "true"}
+        ],
+        "rules": [{"required": true, "message": "请选择应用数据处理方式"}]
+      }
+    ]
+  }
+]

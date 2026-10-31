@@ -1,0 +1,26 @@
+{
+  "python_version": "3.12.16",
+  "release": "20261026",
+  "source": "https://github.com/astral-sh/python-build-standalone/releases/tag/20261026",
+  "digest_source": "Official GitHub release asset digest (sha256), read 2026-11-01",
+  "license_commit": "fa506e0858ac9f2cc5b289c137b888a2aa24d1ee",
+  "license_files": [
+    "LICENSE", "LICENSE.bdb.txt", "LICENSE.bzip2.txt", "LICENSE.cpython.txt",
+    "LICENSE.expat.txt", "LICENSE.libX11.txt", "LICENSE.libXau.txt", "LICENSE.libedit.txt",
+    "LICENSE.libffi.txt", "LICENSE.liblzma.txt", "LICENSE.libuuid.txt", "LICENSE.libxcb.txt",
+    "LICENSE.mpdecimal.txt", "LICENSE.ncurses.txt", "LICENSE.openssl-3.txt", "LICENSE.sqlite.txt",
+    "LICENSE.tcl.txt", "LICENSE.tix.txt", "LICENSE.zlib-ng.txt", "LICENSE.zlib.txt", "LICENSE.zstd.txt"
+  ],
+  "assets": {
+    "x86_64": {
+      "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20261026/cpython-3.12.16%2B20261026-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz",
+      "sha256": "ce4f6d0a6cfdb3bed6e44c2f9affd85943c76a42e25ad3a259002f31d6fb8a20",
+      "published_digest_url": "https://api.github.com/repos/astral-sh/python-build-standalone/releases/assets/678575315"
+    },
+    "arm64": {
+      "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20261026/cpython-3.12.16%2B20261026-aarch64-unknown-linux-gnu-install_only_stripped.tar.gz",
+      "sha256": "bb4b6392670c5d3f93876996fcaa19858a4a413a0c7720144c18b0d6f1f0db2d",
+      "published_digest_url": "https://api.github.com/repos/astral-sh/python-build-standalone/releases/assets/678574577"
+    }
+  }
+}
