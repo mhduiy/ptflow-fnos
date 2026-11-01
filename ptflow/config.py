@@ -15,7 +15,7 @@ DEFAULTS = {
     "downloader": {"url": "", "auth_type": "password", "username": "", "password": "", "api_key": "", "save_path": ""},
     "mteam": {"url": "https://api.m-team.cc", "api_key": "", "proxy_url": "", "modes": ["movie", "tvshow", "normal"], "request_interval_seconds": 60, "page_size": 100},
     "schedule": {"enabled": False, "query_minutes": 30, "brush_minutes": 15, "cleanup_minutes": 10, "stats_seconds": 30, "work_start": "00:00", "work_end": "00:00", "timezone": "Asia/Shanghai"},
-    "strategy": {"min_free_gib": 50, "max_downloading": 4, "target_upload_mib": 2, "max_download_mib": 20, "speed_window_minutes": 10, "min_free_hours": 3, "max_torrent_gib": 10, "min_seeders": 1, "min_leechers": 1, "cleanup_enabled": False, "idle_minutes": 60, "protect_seed_hours": 24, "delete_files": False},
+    "strategy": {"min_free_gib": 50, "max_downloading": 4, "target_upload_mib": 2, "max_download_mib": 20, "speed_window_minutes": 10, "min_free_hours": 3, "min_torrent_gib": 0, "max_torrent_gib": 10, "min_seeders": 1, "min_leechers": 1, "cleanup_enabled": False, "idle_minutes": 60, "protect_seed_hours": 24, "delete_files": False},
 }
 SECRET_FIELDS = ("downloader.password", "downloader.api_key", "mteam.api_key")
 
@@ -79,11 +79,13 @@ def validate_config(value, previous=None):
         item = result[section][key]
         if not isinstance(item, int) or not minimum <= item <= maximum:
             raise ValueError(f"{path} 必须为 {minimum}–{maximum} 的整数")
-    for key in ("min_free_gib", "target_upload_mib", "max_download_mib", "min_free_hours", "max_torrent_gib", "protect_seed_hours"):
+    for key in ("min_free_gib", "target_upload_mib", "max_download_mib", "min_free_hours", "min_torrent_gib", "max_torrent_gib", "protect_seed_hours"):
         item = result["strategy"][key]
         minimum = 0.01 if key in ("max_download_mib", "max_torrent_gib") else 0
         if not minimum <= item <= 100000:
             raise ValueError(f"strategy.{key} 必须在 {minimum}–100000 之间")
+    if result["strategy"]["min_torrent_gib"] > result["strategy"]["max_torrent_gib"]:
+        raise ValueError("种子总大小下限不能超过上限")
     if result["downloader"]["auth_type"] not in ("password", "api_key"):
         raise ValueError("qBittorrent 认证方式应为 password 或 api_key")
     modes = result["mteam"]["modes"]
@@ -119,6 +121,11 @@ def validate_config(value, previous=None):
     if schedule["enabled"] and (not result["downloader"]["url"] or not result["mteam"]["api_key"]):
         raise ValueError("开启自动调度前，请先填写 qBittorrent 地址和 M-Team API Key")
     return result
+
+
+def torrent_size_bounds(strategy):
+    """Inclusive whole-torrent limits, rounded inward to integer bytes."""
+    return math.ceil(strategy["min_torrent_gib"] * 2**30), math.floor(strategy["max_torrent_gib"] * 2**30)
 
 
 def is_work_time(config, now=None):

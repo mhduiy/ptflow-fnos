@@ -307,17 +307,6 @@ def validate_files(files):
         indexes.add(row["index"])
 
 
-def select_files(files, budget):
-    """Select whole files only; smallest first makes at least one fit when possible."""
-    validate_files(files)
-    selected, total = [], 0
-    for row in sorted(files, key=lambda row: (row["size"], row["index"])):
-        if row["size"] > 0 and total + row["size"] <= budget:
-            selected.append(row["index"])
-            total += row["size"]
-    return selected, total
-
-
 def torrent_metadata(content):
     """Validate BEP 3 and hash the original info slice, never a re-encoding."""
     if not content or len(content) > 16 * 1024 * 1024:
@@ -399,7 +388,7 @@ def torrent_metadata(content):
                 lengths.append(file.get(b"length"))
         else:
             lengths = [info.get(b"length")]
-        if any(type(n) is not int or n < 0 for n in lengths) or sum(lengths) <= 0:
+        if any(type(n) is not int or n < 0 for n in lengths) or not 0 < sum(lengths) <= 2**63 - 1:
             raise ValueError
         total = sum(lengths)
         if len(pieces) != ((total + piece_length - 1) // piece_length) * 20:

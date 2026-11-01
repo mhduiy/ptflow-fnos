@@ -5,10 +5,12 @@ from io import StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 import unittest
+import time
 
-from ptflow.config import Config, is_work_time
+from ptflow.config import Config, atomic_json, is_work_time
 from ptflow.web import create_app
 
 
@@ -82,6 +84,92 @@ class WebBehaviorTests(TestCase):
             self.assertEqual(Config(self.temporary.name).get()["mteam"]["proxy_url"], "http://127.0.0.1:7890")
             self.assertEqual(self.client.put("/api/config", json={"mteam": {"proxy_url": ""}}, headers=headers).status_code, 200)
             self.assertEqual(Config(self.temporary.name).get()["mteam"]["proxy_url"], "")
+
+    def test_initial_candidate_get_filters_legacy_rows_and_uses_current_range(self):
+        config = self.app.extensions["ptflow_config"]
+        legacy = config.get()
+        legacy["strategy"]["max_torrent_gib"] = 2
+        del legacy["strategy"]["min_torrent_gib"]
+        atomic_json(config.path, legacy)
+        store = self.app.extensions["ptflow_store"]
+        for size in (1, 2, 3):
+            store.upsert_candidate({"id": str(size), "name": "legacy", "size": size * 2**30,
+                                    "seeders": 2, "leechers": 3, "free_until": time.time() + 86400,
+                                    "score": size, "mode": "movie"})
+        store.update_candidate("3", state="submitted", qb_hash="a" * 40)
+        self.app = create_app(self.temporary.name, start_scheduler=False)
+        self.client = self.app.test_client()
+        self.token = self.client.get("/api/auth").json["csrf_token"]
+        self.setup_login()
+        self.assertEqual({row["id"] for row in self.client.get("/api/candidates").json["items"]}, {"1", "2"})
+        self.app.extensions["ptflow_config"].save({"strategy": {"min_torrent_gib": 2}})
+        self.assertEqual([row["id"] for row in self.client.get("/api/candidates").json["items"]], ["2"])
+        self.assertEqual(len(self.app.extensions["ptflow_store"].candidates()), 3)
+
+    def test_config_range_prunes_only_unowned_pending_and_failed_rows(self):
+        self.setup_login()
+        store = self.app.extensions["ptflow_store"]
+        entries = (("minimum", 1, "pending", ""), ("maximum", 2, "failed", ""),
+                   ("small", 0.5, "pending", ""), ("large", 3, "failed", ""),
+                   ("submitted", 3, "submitted", "a" * 40), ("uncertain", 0.5, "uncertain", "b" * 40),
+                   ("hashed-pending", 0.5, "pending", "c" * 40), ("hashed-failed", 3, "failed", "d" * 40),
+                   ("unhashed-uncertain", 3, "uncertain", ""), ("unhashed-submitted", 0.5, "submitted", ""))
+        for identifier, size, state, qb_hash in entries:
+            store.upsert_candidate({"id": identifier, "name": identifier, "size": int(size * 2**30),
+                                    "seeders": 2, "leechers": 3, "free_until": time.time() + 86400,
+                                    "score": 1, "mode": "movie"})
+            store.update_candidate(identifier, state=state, qb_hash=qb_hash, submitted_at=123, last_activity=456)
+        original = {row["id"]: row for row in store.candidates()}
+        headers = {**self.origin, "X-CSRF-Token": self.token}
+        with patch("ptflow.web.Engine") as engine, redirect_stdout(StringIO()):
+            response = self.client.put("/api/config", json={"strategy": {"min_torrent_gib": 1, "max_torrent_gib": 2}}, headers=headers)
+            self.assertEqual(response.status_code, 200)
+            engine.assert_not_called()
+        self.assertEqual({row["id"]: row for row in store.candidates()},
+                         {key: row for key, row in original.items() if key not in ("small", "large")})
+        self.assertEqual({row["id"] for row in self.client.get("/api/candidates").json["items"]}, {"minimum", "maximum"})
+        saved, saved_bytes = self.app.extensions["ptflow_config"].get(), Path(self.temporary.name, "config.json").read_bytes()
+        for invalid in ({"min_torrent_gib": -1}, {"min_torrent_gib": 3}, {"max_torrent_gib": 0},
+                        {"min_torrent_gib": "1"}, {"max_torrent_gib": float("inf")}):
+            with self.subTest(strategy=invalid), patch.object(store, "prune_candidates") as prune:
+                self.assertEqual(self.client.put("/api/config", json={"strategy": invalid}, headers=headers).status_code, 400)
+                prune.assert_not_called()
+                self.assertEqual(self.app.extensions["ptflow_config"].get(), saved)
+                self.assertEqual(Path(self.temporary.name, "config.json").read_bytes(), saved_bytes)
+        with redirect_stdout(StringIO()):
+            self.assertEqual(self.client.put("/api/config", json={"strategy": {"max_torrent_gib": 1}}, headers=headers).status_code, 200)
+        self.assertEqual([row["id"] for row in self.client.get("/api/candidates").json["items"]], ["minimum"])
+        self.assertEqual({row["id"] for row in store.candidates()}, set(original) - {"small", "large", "maximum"})
+
+    def test_post_save_prune_failure_reports_committed_effective_configuration(self):
+        self.setup_login()
+        store = self.app.extensions["ptflow_store"]
+        store.upsert_candidate({"id": "stale", "name": "stale", "size": 3 * 2**30,
+                                "seeders": 2, "leechers": 3, "free_until": time.time() + 86400,
+                                "score": 1, "mode": "movie"})
+        with store.connection() as db:
+            db.execute("CREATE TRIGGER prune_failure BEFORE DELETE ON candidates BEGIN SELECT RAISE(ABORT, 'candidate prune unavailable'); END")
+        scheduler = self.app.extensions["ptflow_scheduler"]
+        headers = {**self.origin, "X-CSRF-Token": self.token}
+        with patch.object(scheduler, "reschedule", wraps=scheduler.reschedule) as reschedule:
+            response = self.client.put("/api/config", json={"strategy": {"min_torrent_gib": 1, "max_torrent_gib": 2},
+                                                          "schedule": {"query_minutes": 47}}, headers=headers)
+            reschedule.assert_called_once_with()
+        self.assertEqual(response.status_code, 500)
+        self.assertTrue(response.json["committed"])
+        self.assertIn("候选清理失败", response.json["error"])
+        self.assertIn("candidate prune unavailable", response.json["error"])
+        self.assertEqual(response.json["result"]["strategy"]["min_torrent_gib"], 1)
+        reopened = Config(self.temporary.name).get()
+        self.assertEqual((reopened["strategy"]["min_torrent_gib"], reopened["strategy"]["max_torrent_gib"],
+                          reopened["schedule"]["query_minutes"]), (1, 2, 47))
+        self.assertEqual(self.client.get("/api/candidates").json["items"], [])
+        self.assertEqual(store.candidates()[0]["id"], "stale")
+        with store.connection() as db:
+            db.execute("DROP TRIGGER prune_failure")
+        with redirect_stdout(StringIO()):
+            self.assertEqual(self.client.put("/api/config", json={}, headers=headers).status_code, 200)
+        self.assertEqual(store.candidates(), [])
 
     def test_committed_writes_survive_failed_audit_write(self):
         old_secret, new_secret = "audit-old-managed-secret", "audit-new-managed-secret"

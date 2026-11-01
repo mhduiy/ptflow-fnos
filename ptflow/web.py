@@ -14,7 +14,7 @@ from werkzeug.exceptions import HTTPException
 from werkzeug.security import check_password_hash, generate_password_hash
 
 from . import __version__
-from .config import Config, validate_config
+from .config import Config, torrent_size_bounds, validate_config
 from .engine import Engine
 from .scheduler import Scheduler
 from .store import Store
@@ -220,6 +220,12 @@ def create_app(data_dir, gateway_prefix="", start_scheduler=True):
         result = config.save(body())
         store.secrets = list(set(store.secrets + old_secrets + config.secrets()))
         scheduler.reschedule()
+        try:
+            store.prune_candidates(*torrent_size_bounds(result["strategy"]))
+        except Exception as error:
+            warning = store.redact(f"配置已保存并重排下一次执行时间；但候选清理失败：{type(error).__name__}：{error}。已保存内容不会回滚。")
+            app.logger.error(warning)
+            return jsonify(error=warning, committed=True, result=result), 500
         return committed_response(result, "配置", "配置已保存并重排下一次执行时间；正在运行的任务继续使用启动时配置",
                                   {"query_minutes": result["schedule"]["query_minutes"], "brush_minutes": result["schedule"]["brush_minutes"], "automatic": result["schedule"]["enabled"]})
 
@@ -264,7 +270,8 @@ def create_app(data_dir, gateway_prefix="", start_scheduler=True):
 
     @app.get("/api/candidates")
     def candidates():
-        return jsonify(items=store.candidates())
+        minimum, maximum = torrent_size_bounds(config.get()["strategy"])
+        return jsonify(items=store.candidates(minimum_size=minimum, maximum_size=maximum))
 
     def integer_argument(key, default, minimum, maximum):
         try:

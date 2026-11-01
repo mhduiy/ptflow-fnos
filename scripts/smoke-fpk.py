@@ -118,7 +118,7 @@ def check_package(package):
                 status, raw = request("/app/ptflow-fnos/api/" + path, method, body, administrator)
                 return status, json.loads(raw)
 
-            def run(kind):
+            def run(kind, expected="succeeded"):
                 deadline = time.monotonic() + 30
                 while time.monotonic() < deadline:
                     status, state = api("status")
@@ -136,7 +136,7 @@ def check_package(package):
                     status, history = api("runs")
                     item = next((item for item in history["items"] if item["id"] == result["id"]), None)
                     if item and item["status"] != "running" and api("status")[1]["current_run"] is None:
-                        assert item["status"] == "succeeded", item
+                        assert item["status"] == expected, item
                         return item
                     time.sleep(0.1)
                 raise AssertionError(f"{kind} did not finish: {result}")
@@ -224,14 +224,34 @@ finally:
                     "mteam": {"url": simulator.url, "api_key": "smoke-site-secret", "modes": ["movie"],
                               "request_interval_seconds": 1},
                     "schedule": {"query_minutes": 77, "stats_seconds": 3600},
-                    "strategy": {"min_free_gib": 1, "max_downloading": 1, "max_torrent_gib": 12 / 1024}})
+                    "strategy": {"min_free_gib": 1, "max_downloading": 1,
+                                 "min_torrent_gib": 0, "max_torrent_gib": 12 / 1024}})
                 assert status == 200 and configuration["schedule"]["query_minutes"] == 77
-                run("query")
+                # A 32MiB package cannot enter the candidate list under a 12MiB total cap.
+                assert run("query")["counts"]["persisted"] == 0
+                run("brush", "skipped")
+                assert api("candidates")[1]["items"] == [] and simulator.adds == []
+                status, configuration = api("config", "PUT", {
+                    "strategy": {"min_torrent_gib": 32 / 1024, "max_torrent_gib": 32 / 1024}})
+                assert status == 200
+                assert run("query")["counts"]["persisted"] == 2
+                # Even though individual files fit, disk headroom must fit the entire package.
+                simulator.server_state["free_space_on_disk"] = 1024**3 + 20 * 1024**2
+                run("brush", "skipped")
+                assert simulator.adds == [] and "/api/torrent/genDlToken" not in simulator.calls
+                simulator.server_state["free_space_on_disk"] = 1024**3 + 32 * 1024**2
                 run("brush")
+                assert simulator.resume_sizes == [32 * 1024**2]
+                assert all(file["priority"] > 0 for files in simulator.files.values() for file in files)
                 status, candidates = api("candidates")
                 submitted = [item for item in candidates["items"] if item["state"] == "submitted"]
                 assert len(submitted) == 1 and submitted[0]["qb_hash"] in simulator.rows
                 assert len(api("torrents")[1]["items"]) == 1
+                # Tightening the total cap hides/prunes unowned candidates, not the owned qB job.
+                status, configuration = api("config", "PUT", {
+                    "strategy": {"min_torrent_gib": 0, "max_torrent_gib": 12 / 1024}})
+                assert status == 200 and api("candidates")[1]["items"] == []
+                assert len(api("torrents")[1]["items"]) == 1 and simulator.adds == ["1"]
                 for filename in ("config.json", "auth.json", "ptflow.sqlite3"):
                     info = (private / filename).stat()
                     assert info.st_uid == account.pw_uid and info.st_mode & 0o777 == 0o600
@@ -368,7 +388,7 @@ finally:
                 assert unrelated.read_bytes() == b"not PTFlow application data"
                 assert simulator.calls == before_calls and simulator.rows == qb_rows
                 assert (sentinel.read_bytes(), sentinel.stat().st_uid, sentinel.stat().st_mode) == sentinel_snapshot
-                print(f"PASS {package.name}: real cmd install/repeated start-stop/upgrade/reinstall; both gateway paths, administrator setup, retained credentials/SQLite ownership; private permissions, bounded log, stale/corrupt/foreign PID safety, symlink refusal, failed-start cleanup; explicit app-only deletion and no uninstall qB calls (loopback simulator, not fnOS manager)")
+                print(f"PASS {package.name}: real cmd install/repeated start-stop/upgrade/reinstall; inclusive whole-torrent bounds reject oversized results before persistence, full-package disk hold and all-files start; both gateway paths, administrator setup, retained credentials/SQLite ownership; private permissions, bounded log, stale/corrupt/foreign PID safety, symlink refusal, failed-start cleanup; explicit app-only deletion and no uninstall qB calls (loopback simulator, not fnOS manager)")
             finally:
                 if record_path.is_symlink():
                     record_path.unlink()

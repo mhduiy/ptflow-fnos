@@ -128,12 +128,25 @@ class Store:
                 ON CONFLICT(id) DO UPDATE SET name=excluded.name,size=excluded.size,seeders=excluded.seeders,
                 leechers=excluded.leechers,free_until=excluded.free_until,score=excluded.score,mode=excluded.mode,updated_at=excluded.updated_at""", (*values, time.time()))
 
-    def candidates(self, limit=500):
+    def candidates(self, limit=500, *, minimum_size=None, maximum_size=None):
+        clauses, values = [], []
+        if minimum_size is not None:
+            clauses.append("size >= ?")
+            values.append(minimum_size)
+        if maximum_size is not None:
+            clauses.append("size <= ?")
+            values.append(maximum_size)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
         with self.connection() as db:
-            return [dict(row) for row in db.execute("SELECT * FROM candidates ORDER BY score DESC,id LIMIT ?", (min(max(1, limit), 100000),))]
+            return [dict(row) for row in db.execute(f"SELECT * FROM candidates{where} ORDER BY score DESC,id LIMIT ?", (*values, min(max(1, limit), 100000)))]
+
+    def prune_candidates(self, minimum_size, maximum_size):
+        with self.connection() as db:
+            return db.execute("""DELETE FROM candidates WHERE state IN ('pending','failed') AND qb_hash = ''
+                AND (size < ? OR size > ?)""", (minimum_size, maximum_size)).rowcount
 
     def update_candidate(self, identifier, **fields):
-        allowed = {"state", "reason", "qb_hash", "last_activity", "submitted_at"}
+        allowed = {"state", "reason", "qb_hash", "last_activity", "submitted_at", "size"}
         if not fields or set(fields) - allowed:
             raise ValueError("无效的候选更新字段")
         with self.connection() as db:

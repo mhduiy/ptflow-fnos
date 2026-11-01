@@ -7,7 +7,8 @@ import time
 from threading import Event, Thread
 from zoneinfo import ZoneInfo
 
-from .integrations import IntegrationError, MTeam, QBittorrent, select_files, torrent_metadata
+from .config import torrent_size_bounds
+from .integrations import IntegrationError, MTeam, QBittorrent, torrent_metadata
 
 GIB = 1024 ** 3
 MIB = 1024 ** 2
@@ -103,6 +104,8 @@ class Engine:
 
     def query(self):
         self._event("INFO", "query", "串行查询 Free 候选；入库不等于提交下载器")
+        minimum_size, maximum_size = torrent_size_bounds(self.strategy)
+        self.store.prune_candidates(minimum_size, maximum_size)
         mt = self._mt()
         settings = self.config["mteam"]
         counts = {"returned": 0, "persisted": 0, "skipped": 0, "failed": 0, "protection_failed": 0}
@@ -152,6 +155,8 @@ class Engine:
                 for item in rows:
                     try:
                         row = candidate(item, mode, time.time())
+                        if not minimum_size <= row["size"] <= maximum_size:
+                            raise ValueError("种子总大小超出最小/最大范围；不入候选列表")
                     except (ValueError, TypeError) as error:
                         counts["skipped"] += 1
                         self._event("INFO", "query.filter", str(error), {
@@ -200,6 +205,7 @@ class Engine:
     def _expire(self, qb, rows):
         count, failed = 0, 0
         horizon = time.time() + self.strategy["min_free_hours"] * 3600
+        minimum_size, maximum_size = torrent_size_bounds(self.strategy)
         for row, record in owned(rows, self.store.candidates(limit=100000)):
             if record["free_until"] > horizon or (row.get("progress", 0) >= 1 and row.get("dlspeed", 0) <= 0):
                 continue
@@ -213,6 +219,7 @@ class Engine:
                     if not stopped_row or stopped_row.get("state") not in STOPPED or stopped_row.get("dlspeed", 0) > 0:
                         raise IntegrationError("临期下载停止状态未确认，禁止新增")
                 files = qb.files(torrent_hash)
+                may_start = running or minimum_size <= sum(f["size"] for f in files) <= maximum_size
                 incomplete = [f["index"] for f in files if f.get("progress", 0) < 1 and f["priority"] != 0]
                 if not incomplete:
                     if running:
@@ -222,8 +229,10 @@ class Engine:
                 after = qb.files(torrent_hash)
                 if any(f.get("progress", 0) < 1 and f["priority"] != 0 for f in after):
                     raise IntegrationError("临近 Free 结束：文件优先级未生效，保持停止")
-                qb.start(torrent_hash)
-                self.store.update_candidate(record["id"], reason="Free 窗口不足：停止所有未完成文件下载，保留数据供做种")
+                if may_start:
+                    qb.start(torrent_hash)
+                prefix = "待准备：" if record.get("reason", "").startswith("待准备：") else ""
+                self.store.update_candidate(record["id"], reason=prefix + "Free 窗口不足：停止所有未完成文件下载，保留数据供做种")
                 self._event("INFO", "free.protect", "已禁用未完成文件下载；保留种子和已下载数据做种", {
                     "id": record["id"], "hash": torrent_hash, "files_disabled": len(incomplete),
                     "free_until": record["free_until"],
@@ -284,7 +293,7 @@ class Engine:
                 raise IntegrationError("已确认的添加任务未能停止；保留所有权，不启动未核验的文件")
         return row
 
-    def _prepare(self, qb, row, record, budget):
+    def _prepare(self, qb, row, record, disk_available):
         torrent_hash = row["hash"]
         if row.get("state") not in STOPPED or row.get("dlspeed", 0) > 0:
             qb.stop(torrent_hash)
@@ -292,28 +301,31 @@ class Engine:
             if not stopped or stopped.get("state") not in STOPPED or stopped.get("dlspeed", 0) > 0:
                 raise IntegrationError("QB 停止状态未确认，禁止准备或启动文件")
         files = qb.files(torrent_hash)
-        selected, size = select_files(files, budget)
-        if not selected:
-            qb.priority(torrent_hash, [f["index"] for f in files], 0)
-            self._reason(record["id"], "预算无法容纳任何完整文件：保持停止，不下载不需要的数据")
+        size = sum(f["size"] for f in files)
+        self.store.update_candidate(record["id"], size=size)
+        minimum_size, maximum_size = torrent_size_bounds(self.strategy)
+        if not minimum_size <= size <= maximum_size:
+            self._reason(record["id"], "待准备：种子总大小超出最小/最大范围；保留所有权并保持停止")
             return 0
-        # No downloading can start until both priority calls and read-back succeed.
-        qb.priority(torrent_hash, [f["index"] for f in files if f["index"] not in selected], 0)
-        qb.priority(torrent_hash, selected, 1)
+        if size > disk_available:
+            self._reason(record["id"], "待准备：磁盘余量无法容纳整个种子；保持停止，不缩减文件")
+            return 0
+        # No downloading can start until all priorities and read-back succeed.
+        qb.priority(torrent_hash, [f["index"] for f in files], 1)
         after = qb.files(torrent_hash)
-        actual = {f["index"] for f in after if f["priority"] != 0}
-        if actual != set(selected) or sum(f["size"] for f in after if f["priority"] != 0) > budget:
-            raise IntegrationError("文件预算校验失败：保持停止，未启动下载")
+        if ({(f["index"], f["size"]) for f in after} != {(f["index"], f["size"]) for f in files}
+                or any(f["priority"] == 0 for f in after)):
+            raise IntegrationError("全文件优先级校验失败：保持停止，未启动下载")
         if record["free_until"] <= time.time() + self.strategy["min_free_hours"] * 3600:
-            self._reason(record["id"], "准备文件期间 Free 窗口不足：保持停止")
+            self._reason(record["id"], "待准备：准备文件期间 Free 窗口不足；保持停止")
             return 0
         qb.start(torrent_hash)
         actual_row = matching(qb.torrents(), torrent_hash, record["id"])
         state = actual_row.get("state") if actual_row else "未确认"
-        self.store.update_candidate(record["id"], reason=f"已核验完整文件预算并请求启动；实际 QB 状态：{state}")
-        self._event("INFO", "qb.start", "完整文件预算已核验；启动接口成功不等于正在下载", {
-            "id": record["id"], "hash": torrent_hash, "selected_files": len(selected),
-            "selected_bytes": size, "budget_bytes": budget, "state": state,
+        self.store.update_candidate(record["id"], reason=f"已核验种子总大小并启用全部文件；实际 QB 状态：{state}")
+        self._event("INFO", "qb.start", "种子总大小和全部文件已核验；启动接口成功不等于正在下载", {
+            "id": record["id"], "hash": torrent_hash, "files": len(files),
+            "total_bytes": size, "disk_available": disk_available, "state": state,
         })
         return size
 
@@ -352,7 +364,9 @@ class Engine:
         qb = self._qb()
         mt = None
         counts = {"submitted": 0, "started": 0, "reconciled": 0, "uncertain": 0, "failed": 0, "skipped": 0}
+        minimum_size, maximum_size = torrent_size_bounds(self.strategy)
         try:
+            self.store.prune_candidates(minimum_size, maximum_size)
             sample = self._sample(qb)
             rows = qb.torrents()
             self._observe(rows)
@@ -362,12 +376,14 @@ class Engine:
                 self._event("ERROR", "free.protect", message, counts)
                 return result("failed", message, **counts)
             recovered = []
+            uncertain_size = 0
             for record in self.store.candidates(limit=100000):
                 if record["state"] != "uncertain":
                     continue
                 if not record.get("qb_hash"):
                     self._reason(record["id"], "不确定记录缺少预期哈希：禁止重发添加请求")
                     counts["uncertain"] += 1
+                    uncertain_size += record["size"]
                     continue
                 confirmed = self._confirm(qb, record)
                 if confirmed:
@@ -375,6 +391,7 @@ class Engine:
                     recovered.append((confirmed, record))
                 else:
                     counts["uncertain"] += 1
+                    uncertain_size += record["size"]
             rows = qb.torrents()
             recovered.extend((row, record) for row, record in owned(rows, self.store.candidates(limit=100000))
                              if record.get("reason", "").startswith("待准备：")
@@ -387,10 +404,9 @@ class Engine:
             if reason:
                 self._event("WARNING", "brush.limits", reason)
                 return result("partial" if counts["uncertain"] else "skipped", reason, **counts)
-            max_budget = int(self.strategy["max_torrent_gib"] * GIB)
             # Reserve absent ambiguous acceptances; late QB visibility must not overfill slots/disk.
             slots = max(0, slots - counts["uncertain"])
-            disk_budget = max(0, disk_budget - counts["uncertain"] * max_budget)
+            disk_budget = max(0, disk_budget - uncertain_size)
             for row, record in recovered:
                 if not slots:
                     break
@@ -401,7 +417,7 @@ class Engine:
                         return result("partial" if counts["reconciled"] else "failed", "Free 保护未确认，本轮禁止新增", **counts)
                     continue
                 try:
-                    size = self._prepare(qb, row, record, min(max_budget, disk_budget))
+                    size = self._prepare(qb, row, record, disk_budget)
                     if size:
                         slots -= 1
                         disk_budget -= size
@@ -409,12 +425,18 @@ class Engine:
                 except IntegrationError as error:
                     counts["failed"] += 1
                     self._reason(record["id"], "待准备：" + str(error))
-            pending = [c for c in self.store.candidates(limit=100000) if c["state"] in ("pending", "failed")]
+            pending = [c for c in self.store.candidates(limit=100000, minimum_size=minimum_size,
+                                                      maximum_size=maximum_size)
+                       if c["state"] in ("pending", "failed") and not c.get("qb_hash")]
             pending.sort(key=lambda c: (-c["score"], c["id"]))
             for record in pending:
                 if not slots or disk_budget <= 0:
                     break
                 identity = record["id"]
+                if record["size"] > disk_budget:
+                    counts["skipped"] += 1
+                    self._reason(identity, "磁盘余量无法容纳整个种子；未下载种子，不缩减文件")
+                    continue
                 if record["free_until"] <= time.time() + self.strategy["min_free_hours"] * 3600:
                     counts["skipped"] += 1
                     self._reason(identity, "Free 剩余时间不足最低下载窗口")
@@ -433,12 +455,19 @@ class Engine:
                     })
                     content = mt.torrent(identity)
                     metadata = torrent_metadata(content)
-                    expected = metadata["hash"]
-                    budget = min(max_budget, disk_budget)
-                    if not any(0 < size <= budget for size in metadata["lengths"]):
+                    size = metadata["size"]
+                    self.store.update_candidate(identity, size=size)
+                    record = {**record, "size": size}
+                    if not minimum_size <= size <= maximum_size:
                         counts["skipped"] += 1
-                        self._reason(identity, "种子预算无法容纳一个完整文件；未向 QB 添加")
+                        self._reason(identity, "实际种子总大小超出最小/最大范围；未向 QB 添加")
+                        self.store.prune_candidates(minimum_size, maximum_size)
                         continue
+                    if size > disk_budget:
+                        counts["skipped"] += 1
+                        self._reason(identity, "磁盘余量无法容纳实际整个种子；未向 QB 添加，不缩减文件")
+                        continue
+                    expected = metadata["hash"]
                     rows = qb.torrents()
                     persisted = self.store.candidates(limit=100000)
                     if (any(str(row["hash"]).lower() == expected for row in rows)
@@ -453,11 +482,14 @@ class Engine:
                         break
                     slots = min(slots, fresh_slots)
                     disk_budget = min(disk_budget, fresh_budget)
-                    budget = min(max_budget, disk_budget)
-                    if not slots or not any(0 < size <= budget for size in metadata["lengths"]):
-                        self._reason(identity, "添加前预算/并发重新检查未通过；未向 QB 添加")
+                    if not slots:
+                        self._reason(identity, "添加前并发重新检查未通过；未向 QB 添加")
                         counts["skipped"] += 1
                         break
+                    if size > disk_budget:
+                        self._reason(identity, "添加前磁盘余量不足整个种子；未向 QB 添加，不缩减文件")
+                        counts["skipped"] += 1
+                        continue
                     if record["free_until"] <= time.time() + self.strategy["min_free_hours"] * 3600:
                         self._reason(identity, "下载种子期间 Free 窗口不足；未向 QB 添加")
                         counts["skipped"] += 1
@@ -468,13 +500,14 @@ class Engine:
                     record = {**record, "qb_hash": expected}
                     attempted = True
                     slots -= 1
-                    disk_budget -= budget
+                    disk_available = disk_budget
+                    disk_budget -= size
                     outcome = qb.add(content, identity, self.config["downloader"].get("save_path", ""))
                     add_returned = True
                     if outcome == "rejected":
                         counts["failed"] += 1
                         slots += 1
-                        disk_budget += budget
+                        disk_budget += size
                         self.store.update_candidate(identity, state="failed", qb_hash="", reason="QB 添加接口明确拒绝；未提交")
                         continue
                     row = self._confirm(qb, record)
@@ -482,14 +515,14 @@ class Engine:
                         counts["uncertain"] += 1
                         continue
                     counts["submitted"] += 1
-                    size = self._prepare(qb, row, record, budget)
-                    if size:
+                    started_size = self._prepare(qb, row, record, disk_available)
+                    if started_size:
                         counts["started"] += 1
-                        disk_budget += budget - size
+                        disk_budget += size - started_size
                     else:
                         counts["skipped"] += 1
                         slots += 1
-                        disk_budget += budget
+                        disk_budget += size
                 except IntegrationError as error:
                     counts["failed"] += 1
                     if attempted:
@@ -502,7 +535,7 @@ class Engine:
                             self._reason(identity, str(error) + "；结果不确定，保留哈希等待核对，不重发", state="uncertain")
                         else:
                             slots += 1
-                            disk_budget += budget
+                            disk_budget += size
                             self.store.update_candidate(identity, state="failed", qb_hash="", reason=self.store.redact(str(error)))
                     else:
                         self._reason(identity, str(error) + "；尚未向 QB 添加，继续处理其他候选", state="failed")

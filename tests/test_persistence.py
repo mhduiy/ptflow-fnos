@@ -6,10 +6,11 @@ from tempfile import TemporaryDirectory
 from unittest import TestCase
 from unittest.mock import patch
 import errno
+import json
 import time
 import uuid
 
-from ptflow.config import Config
+from ptflow.config import Config, atomic_json, torrent_size_bounds
 from ptflow.store import Store
 from ptflow.web import create_app
 
@@ -25,6 +26,18 @@ class PersistenceTests(TestCase):
             {"strategy": {"max_downloading": 1.5}},
             {"strategy": {"max_torrent_gib": 0.001}},
             {"strategy": {"max_torrent_gib": 100001}},
+            {"strategy": {"min_torrent_gib": -0.01}},
+            {"strategy": {"min_torrent_gib": 100001}},
+            {"strategy": {"min_torrent_gib": 11}},
+            {"strategy": {"min_torrent_gib": 2, "max_torrent_gib": 1}},
+            {"strategy": {"min_torrent_gib": float("nan")}},
+            {"strategy": {"min_torrent_gib": float("inf")}},
+            {"strategy": {"min_torrent_gib": True}},
+            {"strategy": {"min_torrent_gib": "1"}},
+            {"strategy": {"min_torrent_gib": None}},
+            {"strategy": {"max_torrent_gib": float("nan")}},
+            {"strategy": {"max_torrent_gib": False}},
+            {"strategy": {"max_torrent_gib": "10"}},
             {"mteam": {"request_interval_seconds": 0}},
             {"mteam": {"page_size": 201}},
             {"mteam": {"modes": []}},
@@ -51,6 +64,35 @@ class PersistenceTests(TestCase):
             result = config.save({"strategy": {"max_torrent_gib": 100000, "min_free_gib": 0}})
             self.assertEqual(result["strategy"]["max_torrent_gib"], 100000)
             self.assertEqual(Config(directory).get()["strategy"]["min_free_gib"], 0)
+
+    def test_legacy_settings_add_minimum_without_resetting_saved_values(self):
+        with TemporaryDirectory() as directory:
+            config = Config(directory)
+            config.save({"strategy": {"max_torrent_gib": 37.5},
+                         "mteam": {"proxy_url": "http://127.0.0.1:7890", "api_key": uuid.uuid4().hex},
+                         "downloader": {"auth_type": "api_key", "api_key": uuid.uuid4().hex}})
+            legacy, auth = config.get(), config.auth.copy()
+            del legacy["strategy"]["min_torrent_gib"]
+            atomic_json(config.path, legacy)
+            reopened = Config(directory)
+            self.assertEqual(reopened.get(), {**legacy, "strategy": {**legacy["strategy"], "min_torrent_gib": 0}})
+            self.assertEqual(reopened.auth, auth)
+            self.assertEqual(reopened.public()["mteam"]["api_key"], "")
+            reopened.save({"schedule": {"query_minutes": 47}})
+            self.assertEqual(json.loads(config.path.read_text())["strategy"]["min_torrent_gib"], 0)
+            self.assertEqual(Config(directory).get()["strategy"]["max_torrent_gib"], 37.5)
+
+    def test_total_size_limits_allow_equality_and_round_inward(self):
+        gib = 2**30
+        with TemporaryDirectory() as directory:
+            config = Config(directory)
+            self.assertEqual(torrent_size_bounds(config.get()["strategy"]), (0, 10 * gib))
+            config.save({"strategy": {"min_torrent_gib": 2, "max_torrent_gib": 2}})
+            self.assertEqual(torrent_size_bounds(Config(directory).get()["strategy"]), (2 * gib, 2 * gib))
+            config.save({"strategy": {"min_torrent_gib": 1 + 0.25 / gib, "max_torrent_gib": 2 + 0.75 / gib}})
+            self.assertEqual(torrent_size_bounds(config.get()["strategy"]), (gib + 1, 2 * gib))
+            config.save({"strategy": {"min_torrent_gib": 0, "max_torrent_gib": 0.01}})
+            self.assertEqual(torrent_size_bounds(config.get()["strategy"]), (0, 10737418))
 
     def test_failed_settings_write_preserves_restart_state_and_private_files(self):
         with TemporaryDirectory() as directory:
@@ -110,6 +152,25 @@ class PersistenceTests(TestCase):
             for identifier, row in rows.items():
                 self.assertEqual((row["qb_hash"], row["submitted_at"], row["last_activity"]), (identifier * 40, 123, 456))
                 self.assertEqual(row["leechers"], 8)
+
+    def test_candidate_size_filter_runs_before_limit_and_size_correction_persists(self):
+        with TemporaryDirectory() as directory:
+            store = Store(directory)
+            base = {"name": "candidate", "seeders": 2, "leechers": 3, "free_until": time.time() + 86400,
+                    "score": 1, "mode": "movie"}
+            for identifier, size, score in (("small", 99, 100), ("large", 201, 99), ("minimum", 100, 2), ("maximum", 200, 1)):
+                store.upsert_candidate({**base, "id": identifier, "size": size, "score": score})
+            self.assertEqual([row["id"] for row in store.candidates(limit=2, minimum_size=100, maximum_size=200)],
+                             ["minimum", "maximum"])
+            self.assertEqual(store.candidates(limit=1, minimum_size=100)[0]["id"], "large")
+            self.assertEqual(store.candidates(limit=1, maximum_size=200)[0]["id"], "small")
+            self.assertEqual(len(store.candidates()), 4)
+            store.update_candidate("large", size=150, state="submitted", qb_hash="a" * 40)
+            restarted = Store(directory)
+            self.assertEqual(restarted.candidates(limit=1, minimum_size=100, maximum_size=200)[0]["size"], 150)
+            self.assertEqual(restarted.prune_candidates(100, 200), 1)
+            self.assertEqual({row["id"] for row in restarted.candidates()}, {"large", "minimum", "maximum"})
+            self.assertEqual(restarted.prune_candidates(100, 200), 0)
 
     def test_all_retained_events_remain_readable_at_pruning_boundary(self):
         with TemporaryDirectory() as directory, redirect_stdout(StringIO()):

@@ -1,5 +1,5 @@
 appname         = ptflow-fnos
-version         = 1.0.8
+version         = 1.0.9
 display_name    = PTFlow
 desc            = PTFlow：飞牛原生 PT 刷流管理器，M-Team / qBittorrent，离线内置 Python 运行时。
 platform        = x86

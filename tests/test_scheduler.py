@@ -56,7 +56,7 @@ class SchedulerTests(unittest.TestCase):
         self.config = Config(Path(self.directory.name))
         self.config.save({"downloader": {"url": self.sim.url, "username": "simulated-admin", "password": "simulated-auth"},
                           "mteam": {"url": self.sim.url, "api_key": "simulated-api-key", "modes": ["movie"], "request_interval_seconds": 1},
-                          "strategy": {"min_free_gib": 1, "max_torrent_gib": 12 * MIB / GIB}})
+                          "strategy": {"min_free_gib": 1, "max_torrent_gib": 32 * MIB / GIB}})
         self.store = Store(Path(self.directory.name))
         self.store.secrets = self.config.secrets()
         self.scheduler = Scheduler(self.config, self.store)
@@ -185,13 +185,13 @@ class SchedulerTests(unittest.TestCase):
         first = next(record for record in self.store.candidates() if record["id"] == "1")
         self.assertEqual(first["state"], "uncertain")
         self.assertTrue(first["qb_hash"])
-        self.assertEqual(self.sim.resume_budgets, [])
+        self.assertEqual(self.sim.resume_sizes, [])
         self.sim.add_delay = 0
         restarted = Engine(self.config.get(), Store(Path(self.directory.name)), lambda *args: None)
         recovered = restarted.brush()
         self.assertEqual(recovered["counts"]["reconciled"], 1)
         self.assertEqual(self.sim.adds, ["1"])
-        self.assertEqual(self.sim.resume_budgets, [12 * MIB])
+        self.assertEqual(self.sim.resume_sizes, [32 * MIB])
 
     def test_automatic_loop_survives_skipped_event_lock_then_recovers(self):
         now = datetime.now(ZoneInfo("Asia/Shanghai"))

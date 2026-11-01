@@ -22,7 +22,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from ptflow.config import DEFAULTS
 from ptflow.engine import Engine, GIB, MIB, candidate, owned
-from ptflow.integrations import IntegrationError, add_outcome, select_files, torrent_metadata
+from ptflow.integrations import IntegrationError, add_outcome, torrent_metadata
 from ptflow.store import Store
 
 
@@ -36,10 +36,10 @@ def bencode(value):
     return b"d" + b"".join(bencode(k) + bencode(v) for k, v in value.items()) + b"e"
 
 
-def torrent(identity="1"):
-    lengths = [5 * MIB, 7 * MIB, 20 * MIB]
+def torrent(identity="1", lengths=None):
+    lengths = [5 * MIB, 7 * MIB, 20 * MIB] if lengths is None else lengths
     # Intentionally non-sorted keys: info hashing must preserve bytes, not re-encode.
-    info = {b"name": f"seed-{identity}".encode(), b"pieces": b"x" * (sum(lengths) // MIB * 20),
+    info = {b"name": f"seed-{identity}".encode(), b"pieces": b"x" * (((sum(lengths) + MIB - 1) // MIB) * 20),
             b"piece length": MIB, b"files": [{b"length": size, b"path": [f"{i}.bin".encode()]}
                                             for i, size in enumerate(lengths)]}
     raw_info = bencode(info)
@@ -63,7 +63,10 @@ class Simulator:
         self.require_sid = False
         self.invalid_confirmation = False
         self.priority_ignored = False
-        self.resume_budgets = []
+        self.resume_sizes = []
+        self.search_sizes = {1: 32 * MIB, 2: 32 * MIB}
+        self.torrent_lengths = {}
+        self.initial_priority = 1
         self.headers = []
         self.files_status = 200
         self.search_delay = 0
@@ -109,10 +112,10 @@ class Simulator:
                     return
                 if path == "/api/torrent/search":
                     time.sleep(fixture.search_delay)
-                    rows = [{"id": str(i), "name": f"candidate-{i}", "size": 32 * MIB,
+                    rows = [{"id": str(i), "name": f"candidate-{i}", "size": size,
                              "status": {"discount": "FREE", "seeders": 2, "leechers": 10 - i,
                                         "discountEndTime": "2099-01-01 00:00:00"}}
-                            for i in (1, 2)]
+                            for i, size in fixture.search_sizes.items()]
                     rows.append({"id": "3", "name": "not-free", "size": MIB,
                                  "status": {"discount": "NORMAL", "seeders": 1, "leechers": 2,
                                             "discountEndTime": "2099-01-01 00:00:00"}})
@@ -128,7 +131,7 @@ class Simulator:
                     if identity == fixture.limit_download_id:
                         self.reply(b"rejected", 429, {"Retry-After": "60"})
                     else:
-                        self.reply(torrent(identity)[0])
+                        self.reply(torrent(identity, fixture.torrent_lengths.get(identity))[0])
                 elif path == "/api/v2/auth/login":
                     self.reply(fixture.login_body, fixture.login_status,
                                {"Set-Cookie": "SID=secret-cookie; Path=/"} if fixture.login_cookie else {})
@@ -167,7 +170,7 @@ class Simulator:
                         "uploaded": 0, "downloaded": 0, "ratio": 0, "added_on": time.time(),
                         "completion_on": 0, "last_activity": 0,
                     }
-                    fixture.files[torrent_hash] = [{"index": i, "size": n, "priority": 1, "progress": 0}
+                    fixture.files[torrent_hash] = [{"index": i, "size": n, "priority": fixture.initial_priority, "progress": 0}
                                                   for i, n in enumerate(metadata["lengths"])]
                     if fixture.disconnect_add:
                         self.connection.shutdown(socket.SHUT_RDWR)
@@ -188,7 +191,7 @@ class Simulator:
                 elif path in ("/api/v2/torrents/start", "/api/v2/torrents/resume"):
                     torrent_hash = data["hashes"][0]
                     size = sum(f["size"] for f in fixture.files[torrent_hash] if f["priority"])
-                    fixture.resume_budgets.append(size)
+                    fixture.resume_sizes.append(size)
                     fixture.rows[torrent_hash]["state"] = "downloading" if size else "stalledUP"
                     self.reply(b"")
                 elif path in ("/api/v2/torrents/stop", "/api/v2/torrents/pause"):
@@ -223,7 +226,7 @@ class EngineTests(unittest.TestCase):
         self.config = deepcopy(DEFAULTS)
         self.config["downloader"].update(url=self.sim.url, username="admin", password="secret-password")
         self.config["mteam"].update(url=self.sim.url, api_key="secret-mteam", modes=["movie"], request_interval_seconds=0)
-        self.config["strategy"].update(min_free_gib=1, max_torrent_gib=12 * MIB / GIB)
+        self.config["strategy"].update(min_free_gib=1, max_torrent_gib=32 * MIB / GIB)
         self.store = Store(Path(self.directory.name))
         self.store.secrets = ["secret-password", "secret-mteam", "secret-api"]
         self.engine = Engine(self.config, self.store, lambda stage, message: None)
@@ -237,15 +240,17 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(outcome["counts"]["persisted"], 2)
         self.assertTrue(all(c["state"] == "pending" for c in self.store.candidates()))
 
-    def test_hash_is_original_info_bytes_and_budget_is_whole_files(self):
+    def test_hash_is_original_info_bytes_and_malformed_metadata_is_rejected(self):
         content, info = torrent()
         metadata = torrent_metadata(content)
         self.assertEqual(metadata["hash"], hashlib.sha1(info).hexdigest())
+        self.assertEqual(metadata["size"], 32 * MIB)
         with self.assertRaises(IntegrationError):
             torrent_metadata(content + b"garbage")
-        files = [{"index": i, "size": n, "priority": 1} for i, n in enumerate([9, 4, 6])]
-        self.assertEqual(select_files(files, 10), ([1, 2], 10))
-        self.assertEqual(select_files(files, 3), ([], 0))
+        for length, pieces in ((0, b""), (1, b""), (2**63, b"x" * 20)):
+            with self.subTest(length=length), self.assertRaises(IntegrationError):
+                torrent_metadata(bencode({b"info": {b"name": b"bad", b"length": length,
+                                                     b"piece length": max(1, length), b"pieces": pieces}}))
         self.assertEqual(add_outcome(200, b'{"success_count":0,"pending_count":0,"failure_count":1}'), "rejected")
         self.assertEqual(add_outcome(202, b'{"success_count":0,"pending_count":1,"failure_count":0}'), "uncertain")
 
@@ -253,7 +258,8 @@ class EngineTests(unittest.TestCase):
         self.query()
         outcome = self.engine.brush()
         self.assertEqual(outcome["counts"]["submitted"], 2)
-        self.assertEqual(self.sim.resume_budgets, [12 * MIB, 12 * MIB])
+        self.assertEqual(self.sim.resume_sizes, [32 * MIB, 32 * MIB])
+        self.assertTrue(all(f["priority"] > 0 for files in self.sim.files.values() for f in files))
         self.assertEqual(len(self.engine.torrents()), 2)
         self.assertEqual(self.store.latest_sample()["uploaded"], 1234)
         for path, headers in self.sim.headers:
@@ -308,7 +314,7 @@ class EngineTests(unittest.TestCase):
                                          "NO_PROXY": "*", "no_proxy": "*"}):
                 self.query()
                 self.assertEqual(self.engine.brush()["counts"]["submitted"], 2)
-            self.assertEqual(self.sim.resume_budgets, [12 * MIB, 12 * MIB])
+            self.assertEqual(self.sim.resume_sizes, [32 * MIB, 32 * MIB])
             for path, headers in self.sim.headers:
                 if path.startswith(("/redirect/", "/download/")):
                     self.assertNotIn("x-api-key", {key.lower() for key in headers})
@@ -372,15 +378,17 @@ class EngineTests(unittest.TestCase):
         self.query()
         self.config["strategy"]["max_downloading"] = 1
         self.sim.priority_ignored = True
+        self.sim.initial_priority = 0
         self.engine.brush()
-        self.assertFalse(self.sim.resume_budgets)
+        self.assertFalse(self.sim.resume_sizes)
         confirmed = [c for c in self.store.candidates() if c["state"] == "submitted"]
         self.assertEqual(len(confirmed), 1)
         self.assertTrue(confirmed[0]["reason"].startswith("待准备："))
         self.sim.priority_ignored = False
         self.engine.brush()
         self.assertEqual(self.sim.adds, ["1"])
-        self.assertEqual(self.sim.resume_budgets, [12 * MIB])
+        self.assertEqual(self.sim.resume_sizes, [32 * MIB])
+        self.assertTrue(all(f["priority"] > 0 for files in self.sim.files.values() for f in files))
 
     def test_accepted_but_invisible_stays_uncertain_until_actual_hash_appears(self):
         self.query()
@@ -398,18 +406,19 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(self.sim.adds, ["1"])
         self.assertEqual(next(c for c in self.store.candidates() if c["id"] == "1")["state"], "submitted")
 
-    def test_peak_speed_and_no_whole_file_budget_prevent_network_add(self):
+    def test_peak_speed_and_changed_size_range_prevent_network_download(self):
         self.query()
         self.store.sample({"time": time.time() - 30, "upspeed": 0, "dlspeed": 100 * MIB,
                            "uploaded": 1, "downloaded": 2, "free_space": 100 * GIB})
         self.assertEqual(self.engine.brush()["status"], "skipped")
         self.assertFalse(self.sim.adds)
         self.config["strategy"]["max_download_mib"] = 200
-        self.config["strategy"]["max_torrent_gib"] = 4 * MIB / GIB
+        self.config["strategy"]["max_torrent_gib"] = 20 * MIB / GIB
         self.engine.brush()
         self.assertFalse(self.sim.adds)
-        self.assertFalse(self.sim.resume_budgets)
-        self.assertTrue(all(c["state"] == "pending" for c in self.store.candidates()))
+        self.assertFalse(self.sim.resume_sizes)
+        self.assertEqual(self.store.candidates(), [])
+        self.assertNotIn("/api/torrent/genDlToken", self.sim.calls)
 
     def test_ownership_free_protection_and_idle_minimum_age(self):
         self.query()
@@ -584,13 +593,13 @@ class EngineTests(unittest.TestCase):
         self.assertTrue(first["qb_hash"])
         self.assertFalse(first["submitted_at"])
         self.assertEqual(self.sim.adds, ["1"])
-        self.assertEqual(self.sim.resume_budgets, [])
+        self.assertEqual(self.sim.resume_sizes, [])
         self.sim.disconnect_add = False
         restarted = Engine(self.config, Store(Path(self.directory.name)), lambda *args: None)
         recovered = restarted.brush()
         self.assertEqual(recovered["counts"]["reconciled"], 1)
         self.assertEqual(self.sim.adds, ["1"])
-        self.assertEqual(self.sim.resume_budgets, [12 * MIB])
+        self.assertEqual(self.sim.resume_sizes, [32 * MIB])
 
     def test_global_incomplete_manual_queued_tasks_block_additions(self):
         self.query()
@@ -602,6 +611,99 @@ class EngineTests(unittest.TestCase):
                 outcome = self.engine.brush()
                 self.assertEqual(outcome["status"], "skipped")
                 self.assertEqual(self.sim.adds, [])
+
+    def test_query_inclusive_total_size_bounds_never_persist_rejected_results(self):
+        self.config["strategy"].update(min_torrent_gib=32 * MIB / GIB, max_torrent_gib=64 * MIB / GIB)
+        self.sim.search_sizes = {1: 32 * MIB - 1, 2: 32 * MIB, 4: 64 * MIB, 5: 64 * MIB + 1}
+        outcome = self.engine.query()
+        self.assertEqual(outcome["counts"]["persisted"], 2)
+        self.assertEqual({c["id"] for c in self.store.candidates()}, {"2", "4"})
+        self.assertEqual(self.sim.adds, [])
+
+    def test_actual_metadata_outside_bounds_is_corrected_and_pruned_before_add(self):
+        self.config["strategy"].update(min_torrent_gib=32 * MIB / GIB, max_torrent_gib=32 * MIB / GIB)
+        self.query()
+        self.sim.torrent_lengths = {"1": [32 * MIB + 1], "2": [32 * MIB - 1]}
+        outcome = self.engine.brush()
+        self.assertEqual(outcome["counts"]["skipped"], 2)
+        self.assertEqual(self.store.candidates(), [])
+        self.assertEqual(self.sim.adds, [])
+        self.assertEqual(self.sim.resume_sizes, [])
+
+    def test_in_range_actual_metadata_replaces_misleading_reported_size(self):
+        self.config["strategy"]["max_torrent_gib"] = 64 * MIB / GIB
+        self.sim.search_sizes = {1: 48 * MIB}
+        self.sim.torrent_lengths = {"1": [0, 32 * MIB]}
+        self.sim.initial_priority = 0
+        self.assertEqual(self.engine.query()["counts"]["persisted"], 1)
+        self.engine.brush()
+        self.assertEqual(self.store.candidates()[0]["size"], 32 * MIB)
+        self.assertEqual(self.sim.resume_sizes, [32 * MIB])
+        self.assertTrue(all(f["priority"] > 0 for files in self.sim.files.values() for f in files))
+
+    def test_disk_headroom_must_fit_whole_package_without_deselection(self):
+        self.query()
+        self.sim.server_state["free_space_on_disk"] = GIB + 20 * MIB
+        outcome = self.engine.brush()
+        self.assertEqual(outcome["counts"]["skipped"], 2)
+        self.assertEqual(self.sim.adds, [])
+        self.assertNotIn("/api/torrent/genDlToken", self.sim.calls)
+        self.sim.server_state["free_space_on_disk"] = GIB + 32 * MIB
+        self.engine.brush()
+        self.assertEqual(self.sim.adds, ["1"])
+        self.assertEqual(self.sim.resume_sizes, [32 * MIB])
+
+    def test_stopped_owned_job_waits_for_range_and_disk_then_enables_old_deselections(self):
+        torrent_hash = self.managed_download(time.time() + 86400)
+        self.sim.rows[torrent_hash].update(state="stoppedDL", dlspeed=0)
+        self.sim.files[torrent_hash][2]["priority"] = 0
+        self.store.update_candidate("99", reason="待准备：旧任务尚未准备")
+        self.config["strategy"]["max_torrent_gib"] = 20 * MIB / GIB
+        restarted = Engine(self.config, Store(Path(self.directory.name)), lambda *args: None)
+        restarted.brush()
+        self.assertEqual(self.sim.resume_sizes, [])
+        self.assertEqual(len(self.engine.torrents()), 1)
+        self.assertTrue(self.store.candidates()[0]["reason"].startswith("待准备："))
+        self.config["strategy"].update(min_torrent_gib=40 * MIB / GIB, max_torrent_gib=64 * MIB / GIB)
+        restarted.brush()
+        self.assertEqual(self.sim.resume_sizes, [])
+        self.config["strategy"].update(min_torrent_gib=32 * MIB / GIB, max_torrent_gib=32 * MIB / GIB)
+        self.sim.server_state["free_space_on_disk"] = GIB + 20 * MIB
+        restarted.brush()
+        self.assertEqual(self.sim.resume_sizes, [])
+        self.assertTrue(self.store.candidates()[0]["reason"].startswith("待准备："))
+        self.sim.server_state["free_space_on_disk"] = GIB + 32 * MIB
+        restarted.brush()
+        self.assertEqual(self.sim.resume_sizes, [32 * MIB])
+        self.assertTrue(all(f["priority"] > 0 for f in self.sim.files[torrent_hash]))
+        self.assertEqual(self.sim.adds, [])
+        self.assertNotIn("/api/v2/torrents/delete", self.sim.calls)
+
+    def test_stopped_out_of_range_owned_job_stays_stopped_during_free_protection(self):
+        torrent_hash = self.managed_download(time.time() + 10)
+        self.sim.rows[torrent_hash].update(state="stoppedDL", dlspeed=0)
+        self.sim.files[torrent_hash][0]["progress"] = 1
+        self.config["strategy"]["max_torrent_gib"] = 20 * MIB / GIB
+        self.engine.collect()
+        self.assertEqual(self.sim.rows[torrent_hash]["state"], "stoppedDL")
+        self.assertEqual(self.sim.resume_sizes, [])
+        self.assertEqual([f["priority"] for f in self.sim.files[torrent_hash]], [1, 0, 0])
+        self.assertEqual(len(self.engine.torrents()), 1)
+
+    def test_ambiguous_acceptance_reserves_actual_full_size_across_restart(self):
+        self.config["strategy"]["max_torrent_gib"] = 64 * MIB / GIB
+        self.query()
+        self.sim.visible = False
+        self.sim.server_state["free_space_on_disk"] = GIB + 64 * MIB - 1
+        self.engine.brush()
+        self.assertEqual(self.sim.adds, ["1"])
+        restarted = Engine(self.config, Store(Path(self.directory.name)), lambda *args: None)
+        restarted.brush()
+        self.assertEqual(self.sim.adds, ["1"])
+        self.sim.server_state["free_space_on_disk"] = GIB + 64 * MIB
+        restarted.brush()
+        self.assertEqual(self.sim.adds, ["1", "2"])
+        self.assertEqual(self.sim.resume_sizes, [])
 
     def test_invalid_free_expiry_is_rejected(self):
         with self.assertRaises(ValueError):
