@@ -62,6 +62,22 @@ def create_app(data_dir, gateway_prefix="", start_scheduler=True):
         return bool(config.auth["password_hash"] and session.get("authenticated") and session.get("generation") == config.auth["generation"])
 
     def csrf_token():
+        page_origin = request.headers.get("X-PTFlow-Origin", "")
+        if page_origin:
+            parsed, canonical = urlsplit(page_origin), urlsplit(request.host_url)
+            known_authority = not gateway_prefix or canonical.port is not None
+            if (parsed.scheme != canonical.scheme or parsed.hostname != canonical.hostname
+                    or (known_authority and parsed.netloc.lower() != canonical.netloc.lower())
+                    or parsed.username is not None or page_origin != f"{parsed.scheme}://{parsed.netloc}"):
+                raise ValueError("页面来源无效，请从 PTFlow 页面操作")
+            # A foreign browser page cannot send this custom header without CORS preflight.
+            # Keep this bootstrap same-origin: never enable cross-origin credential access.
+            page_origin = f"{parsed.scheme}://{parsed.netloc.lower()}"
+            previous = session.get("csrf_origin")
+            if previous is not None and previous != page_origin:
+                session.pop("csrf_token", None)
+            session["csrf_origin"] = page_origin
+        session.setdefault("csrf_origin", request.host_url.rstrip("/"))
         if "csrf_token" not in session:
             session["csrf_token"] = secrets.token_urlsafe(32)
         return session["csrf_token"]
@@ -73,7 +89,8 @@ def create_app(data_dir, gateway_prefix="", start_scheduler=True):
         if request.method not in ("GET", "HEAD", "OPTIONS"):
             origin = request.headers.get("Origin", "")
             parsed = urlsplit(origin)
-            if parsed.scheme != request.scheme or parsed.netloc.lower() != request.host.lower():
+            expected = urlsplit(session.get("csrf_origin", request.host_url.rstrip("/")))
+            if parsed.scheme != expected.scheme or parsed.netloc.lower() != expected.netloc.lower():
                 return jsonify(error="请求来源不匹配，请从 PTFlow 页面操作"), 403
             supplied = request.headers.get("X-CSRF-Token", "")
             if not supplied or not supplied.isascii() or not hmac.compare_digest(supplied, session.get("csrf_token", "")):
@@ -112,8 +129,9 @@ def create_app(data_dir, gateway_prefix="", start_scheduler=True):
         return value
 
     def establish_session():
+        origin = session.get("csrf_origin", request.host_url.rstrip("/"))
         session.clear()
-        session.update(authenticated=True, generation=config.auth["generation"], csrf_token=secrets.token_urlsafe(32))
+        session.update(authenticated=True, generation=config.auth["generation"], csrf_token=secrets.token_urlsafe(32), csrf_origin=origin)
         session.permanent = True
         return {"authenticated": True, "csrf_token": session["csrf_token"]}
 

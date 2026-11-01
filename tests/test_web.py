@@ -201,6 +201,28 @@ class WebBehaviorTests(TestCase):
             self.assertEqual(response.status_code, 200)
             self.assertEqual(client.get("/app/ptflow-fnos/api/status", headers=forwarded, base_url=base_url).status_code, 200)
 
+    def test_gateway_session_binds_full_browser_origin_when_proxy_omits_port(self):
+        with TemporaryDirectory() as data_dir, redirect_stdout(StringIO()):
+            app = create_app(data_dir, gateway_prefix="/app/ptflow-fnos", start_scheduler=False)
+            client = app.test_client()
+            base_url, browser_origin = "http://nas.example", "http://nas.example:5666"
+            path = "/app/ptflow-fnos/api/"
+            preflight = client.options(path + "auth", base_url=base_url, headers={"Origin": "http://other.example", "Access-Control-Request-Method": "GET", "Access-Control-Request-Headers": "X-PTFlow-Origin"})
+            self.assertNotIn("Access-Control-Allow-Origin", preflight.headers)
+            for invalid in ("http://other.example:5666", "https://nas.example:5666", "http://nas.example:5666/path", "http://user@nas.example:5666"):
+                self.assertEqual(client.get(path + "auth", base_url=base_url, headers={"X-PTFlow-Origin": invalid}).status_code, 400)
+            auth = client.get(path + "auth", base_url=base_url, headers={"X-PTFlow-Origin": browser_origin})
+            headers = {"Origin": browser_origin, "X-CSRF-Token": auth.json["csrf_token"], "X-Trim-Isadmin": "true"}
+            for invalid in ("http://nas.example", "http://nas.example:5667", "https://nas.example:5666", "http://other.example:5666", "null"):
+                self.assertEqual(client.post(path + "setup", json={}, base_url=base_url, headers={**headers, "Origin": invalid}).status_code, 403)
+            self.assertEqual(client.post(path + "setup", json={}, base_url=base_url, headers={**headers, "X-CSRF-Token": "wrong-token"}).status_code, 403)
+            setup = client.post(path + "setup", json={"password": "native-gateway-browser-test-credential"}, base_url=base_url, headers=headers)
+            self.assertEqual(setup.status_code, 200)
+            self.assertTrue(client.get(path + "auth", base_url=base_url).json["authenticated"])
+            headers["X-CSRF-Token"] = setup.json["csrf_token"]
+            self.assertEqual(client.post(path + "logout", json={}, base_url=base_url, headers=headers).status_code, 200)
+            self.assertFalse(client.get(path + "auth", base_url=base_url, headers={"X-PTFlow-Origin": browser_origin}).json["authenticated"])
+
 
 if __name__ == "__main__":
     unittest.main()

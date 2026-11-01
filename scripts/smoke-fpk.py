@@ -92,7 +92,9 @@ def check_package(package):
                     connection.sock.settimeout(10)
                     connection.sock.connect(str(data / "ptflow.sock"))
                     headers = {"Host": "internal.invalid", "X-Forwarded-Host": "nas.local",
-                               "X-Forwarded-Proto": "https", "X-Forwarded-Port": "5667"}
+                               "X-Forwarded-Proto": "https"}
+                    if method == "GET" and path.endswith("/api/auth"):
+                        headers["X-PTFlow-Origin"] = "https://nas.local:5667"
                     if administrator is not None:
                         headers["X-Trim-Isadmin"] = "true" if administrator else "false"
                     if cookie:

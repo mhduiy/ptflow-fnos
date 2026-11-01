@@ -38,6 +38,7 @@
   }
   async function request(path,{method='GET',body}={}) {
     const headers = {'Accept':'application/json'};
+    if (path === 'auth') headers['X-PTFlow-Origin'] = location.origin;
     if (method !== 'GET') { headers['Content-Type'] = 'application/json'; headers['X-CSRF-Token'] = state.csrf; }
     let response;
     try { response = await fetch(new URL(path,apiBase),{method,headers,credentials:'same-origin',cache:'no-store',...(body !== undefined ? {body:JSON.stringify(body)} : {})}); }
