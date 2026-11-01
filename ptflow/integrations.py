@@ -10,6 +10,8 @@ from urllib.parse import urljoin, urlsplit
 
 import requests
 
+from .config import checked_proxy_url
+
 
 class IntegrationError(RuntimeError):
     def __init__(self, message, *, status=None, ambiguous=False):
@@ -112,6 +114,10 @@ class MTeam:
             raise IntegrationError("M-Team API Key 尚未配置")
         self.session = requests.Session()
         self.session.headers.update({"x-api-key": config["api_key"], "User-Agent": "PTFlow/1.0"})
+        proxy = checked_proxy_url(config.get("proxy_url", ""))
+        if proxy:
+            self.session.trust_env = False
+            self.session.proxies.update({"http": proxy, "https": proxy})
         self.emit = emit
 
     def _post(self, endpoint, stage, **kwargs):
@@ -143,6 +149,8 @@ class MTeam:
             raise IntegrationError("mteam.torrent：拒绝 HTTPS 站点返回明文下载凭证链接")
         # The generated download host receives its URL token, never our API key/cookies.
         with requests.Session() as download:
+            download.trust_env = self.session.trust_env
+            download.proxies.update(self.session.proxies)
             _, content = request(download, "GET", link, "mteam.torrent", self.emit, redirects=5)
         return content
 

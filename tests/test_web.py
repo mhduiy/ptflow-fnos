@@ -68,6 +68,21 @@ class WebBehaviorTests(TestCase):
         self.assertEqual(self.client.put("/api/config", json={"mteam": {"url": "http://untrusted.example"}}, headers=headers).status_code, 400)
         self.assertEqual(Path(self.temporary.name, "config.json").stat().st_mode & 0o777, 0o600)
 
+    def test_mteam_proxy_can_be_saved_cleared_and_rejects_invalid_urls(self):
+        self.setup_login()
+        headers = {**self.origin, "X-CSRF-Token": self.token}
+        with redirect_stdout(StringIO()):
+            response = self.client.put("/api/config", json={"mteam": {"proxy_url": "http://127.0.0.1:7890"}}, headers=headers)
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(Config(self.temporary.name).get()["mteam"]["proxy_url"], "http://127.0.0.1:7890")
+            for invalid in ("socks5://proxy:1080", "http://user:secret@proxy:7890", "http://proxy:invalid",
+                            "http://proxy:65536", "http://proxy/path", "http://proxy?token=secret", "http://", "http://proxy host"):
+                with self.subTest(proxy=invalid):
+                    self.assertEqual(self.client.put("/api/config", json={"mteam": {"proxy_url": invalid}}, headers=headers).status_code, 400)
+            self.assertEqual(Config(self.temporary.name).get()["mteam"]["proxy_url"], "http://127.0.0.1:7890")
+            self.assertEqual(self.client.put("/api/config", json={"mteam": {"proxy_url": ""}}, headers=headers).status_code, 200)
+            self.assertEqual(Config(self.temporary.name).get()["mteam"]["proxy_url"], "")
+
     def test_committed_writes_survive_failed_audit_write(self):
         old_secret, new_secret = "audit-old-managed-secret", "audit-new-managed-secret"
         with redirect_stdout(StringIO()):

@@ -6,6 +6,7 @@ from email.parser import BytesParser
 from email.policy import default
 import io
 import hashlib
+import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
@@ -263,6 +264,59 @@ class EngineTests(unittest.TestCase):
         logs = json.dumps(self.store.events(limit=1000), ensure_ascii=False)
         for secret in ("secret-download", "secret-password", "secret-mteam", "secret-cookie"):
             self.assertNotIn(secret, logs)
+
+    def test_mteam_proxy_covers_api_download_and_redirect_without_proxying_qb(self):
+        origin = urlsplit(self.sim.url)
+        unused = socket.socket()
+        self.addCleanup(unused.close)
+        unused.bind(("127.0.0.1", 0))
+        target = f"http://127.0.0.1:{unused.getsockname()[1]}"
+        self.sim.url = target  # Download tokens must also point to an unreachable direct origin.
+        self.config["mteam"]["url"] = target
+
+        class Proxy(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                parsed = urlsplit(self.path)
+                if parsed.netloc != urlsplit(target).netloc:
+                    self.send_error(502, "Only the M-Team origin may use this proxy")
+                    return
+                body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                with closing(http.client.HTTPConnection(origin.hostname, origin.port, timeout=5)) as connection:
+                    connection.request(self.command, parsed.path + ("?" + parsed.query if parsed.query else ""),
+                                       body=body, headers=dict(self.headers))
+                    response = connection.getresponse()
+                    content = response.read()
+                    self.send_response(response.status)
+                    for key, value in response.getheaders():
+                        if key.lower() not in ("connection", "transfer-encoding"):
+                            self.send_header(key, value)
+                    self.end_headers()
+                    self.wfile.write(content)
+
+            do_POST = do_GET
+
+        proxy = ThreadingHTTPServer(("127.0.0.1", 0), Proxy)
+        thread = threading.Thread(target=proxy.serve_forever, daemon=True)
+        thread.start()
+        self.config["mteam"]["proxy_url"] = f"http://127.0.0.1:{proxy.server_port}"
+        try:
+            with patch.dict(os.environ, {"HTTP_PROXY": "http://127.0.0.1:1", "HTTPS_PROXY": "http://127.0.0.1:1",
+                                         "http_proxy": "http://127.0.0.1:1", "https_proxy": "http://127.0.0.1:1",
+                                         "NO_PROXY": "*", "no_proxy": "*"}):
+                self.query()
+                self.assertEqual(self.engine.brush()["counts"]["submitted"], 2)
+            self.assertEqual(self.sim.resume_budgets, [12 * MIB, 12 * MIB])
+            for path, headers in self.sim.headers:
+                if path.startswith(("/redirect/", "/download/")):
+                    self.assertNotIn("x-api-key", {key.lower() for key in headers})
+                    self.assertNotIn("Cookie", headers)
+        finally:
+            proxy.shutdown()
+            proxy.server_close()
+            thread.join()
 
     def test_http_429_does_not_submit_and_later_candidate_proceeds(self):
         self.query()

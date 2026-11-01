@@ -1,2 +1,2 @@
 """PTFlow: native fnOS PT automation."""
-__version__ = "1.0.7"
+__version__ = "1.0.8"

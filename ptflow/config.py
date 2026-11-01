@@ -13,11 +13,30 @@ import tempfile
 
 DEFAULTS = {
     "downloader": {"url": "", "auth_type": "password", "username": "", "password": "", "api_key": "", "save_path": ""},
-    "mteam": {"url": "https://api.m-team.cc", "api_key": "", "modes": ["movie", "tvshow", "normal"], "request_interval_seconds": 60, "page_size": 100},
+    "mteam": {"url": "https://api.m-team.cc", "api_key": "", "proxy_url": "", "modes": ["movie", "tvshow", "normal"], "request_interval_seconds": 60, "page_size": 100},
     "schedule": {"enabled": False, "query_minutes": 30, "brush_minutes": 15, "cleanup_minutes": 10, "stats_seconds": 30, "work_start": "00:00", "work_end": "00:00", "timezone": "Asia/Shanghai"},
     "strategy": {"min_free_gib": 50, "max_downloading": 4, "target_upload_mib": 2, "max_download_mib": 20, "speed_window_minutes": 10, "min_free_hours": 3, "max_torrent_gib": 10, "min_seeders": 1, "min_leechers": 1, "cleanup_enabled": False, "idle_minutes": 60, "protect_seed_hours": 24, "delete_files": False},
 }
 SECRET_FIELDS = ("downloader.password", "downloader.api_key", "mteam.api_key")
+
+
+# ponytail: unauthenticated HTTP(S) only; add separate secret fields if proxy authentication is needed.
+def checked_proxy_url(value):
+    if not isinstance(value, str):
+        raise ValueError("M-Team 专用代理必须是 HTTP(S) 地址文本")
+    url = value.strip().rstrip("/")
+    if not url:
+        return ""
+    try:
+        parsed = urlsplit(url)
+        parsed.port
+        if (parsed.scheme not in ("http", "https") or not parsed.hostname
+                or parsed.username is not None or parsed.password is not None
+                or parsed.path or parsed.query or parsed.fragment or any(ord(c) <= 32 for c in url)):
+            raise ValueError
+    except ValueError:
+        raise ValueError("M-Team 专用代理须为 HTTP(S) 地址，不能含账号密码、路径、查询参数或片段") from None
+    return url
 
 
 def validate_config(value, previous=None):
@@ -84,6 +103,7 @@ def validate_config(value, previous=None):
             raise ValueError(f"{section} 地址须为不含凭证、查询参数的 HTTP(S) 地址")
         if section == "mteam" and parsed.scheme != "https" and parsed.hostname not in ("localhost", "127.0.0.1", "::1"):
             raise ValueError("M-Team 必须使用 HTTPS 保护 API Key")
+    result["mteam"]["proxy_url"] = checked_proxy_url(result["mteam"]["proxy_url"])
     schedule = result["schedule"]
     for key in ("work_start", "work_end"):
         try:
