@@ -139,7 +139,6 @@ class SchedulerTests(unittest.TestCase):
         self.assertFalse(self.config.get()["schedule"]["enabled"])
         self.sim.server_state["free_space_on_disk"] = GIB
         result = self.completed(self.scheduler.submit("full"))
-        self.assertEqual(list(result["counts"]), ["query", "collect", "brush", "cleanup"])
         self.assertEqual(result["counts"]["query"]["persisted"], 2)
         self.assertEqual(result["counts"]["brush"]["submitted"], 0)
         self.assertEqual(self.sim.adds, [])

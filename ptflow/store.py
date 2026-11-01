@@ -1,13 +1,29 @@
 """SQLite state, bounded history and credential-safe structured logs."""
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import local
+from urllib.parse import urlsplit, urlunsplit
+from zoneinfo import ZoneInfo
+import hashlib
 import json
 import os
 import re
 import sqlite3
 import time
+
+
+def account_calendar(zone, now):
+    current = datetime.fromtimestamp(now, ZoneInfo(zone))
+    midnight = datetime.combine(current.date() + timedelta(days=1), datetime.min.time(), current.tzinfo)
+    return current.date().isoformat(), midnight.timestamp()
+
+
+def account_source(settings):
+    parts = urlsplit(settings["url"])
+    origin = urlunsplit((parts.scheme.lower(), parts.netloc.lower(), parts.path.rstrip("/"), "", ""))
+    fingerprint = hashlib.sha256(json.dumps([origin, settings["api_key"]]).encode()).hexdigest()
+    return origin, fingerprint
 
 
 class Store:
@@ -40,6 +56,17 @@ class Store:
                     id TEXT PRIMARY KEY, kind TEXT NOT NULL, source TEXT NOT NULL,
                     started_at REAL NOT NULL, finished_at REAL NOT NULL, status TEXT NOT NULL,
                     message TEXT NOT NULL, counts TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS account_sources (
+                    fingerprint TEXT PRIMARY KEY, origin TEXT NOT NULL, account_id TEXT,
+                    last_attempt_at REAL NOT NULL, next_at REAL NOT NULL,
+                    timezone TEXT NOT NULL, error TEXT NOT NULL DEFAULT ''
+                );
+                CREATE TABLE IF NOT EXISTS account_snapshots (
+                    origin TEXT NOT NULL, account_id TEXT NOT NULL, day TEXT NOT NULL,
+                    time REAL NOT NULL, bonus REAL NOT NULL, uploaded INTEGER NOT NULL,
+                    downloaded INTEGER NOT NULL, ratio REAL,
+                    PRIMARY KEY(origin,account_id,day)
                 );
                 CREATE INDEX IF NOT EXISTS event_run ON events(run_id,id);
             """)
@@ -185,8 +212,69 @@ class Store:
             return rows[:-1:step] + rows[-1:]
         return rows
 
+    def account_stats(self, settings, zone, days=90, now=None):
+        now = time.time() if now is None else now
+        configured = bool(settings["url"] and settings["api_key"])
+        result = {"configured": configured, "latest": None, "history": [], "error": "",
+                  "last_attempt_at": None, "next_at": now if configured else None}
+        if not configured:
+            return result
+        origin, fingerprint = account_source(settings)
+        day, midnight = account_calendar(zone, now)
+        since = (datetime.fromisoformat(day).date() - timedelta(days=min(max(days, 1), 3650) - 1)).isoformat()
+        with self.connection() as db:
+            source = db.execute("SELECT * FROM account_sources WHERE fingerprint=?", (fingerprint,)).fetchone()
+            if source is None:
+                return result
+            result.update(error=source["error"], last_attempt_at=source["last_attempt_at"])
+            if source["timezone"] == zone:
+                result["next_at"] = max(now, source["next_at"])
+            elif account_calendar(zone, source["last_attempt_at"])[0] >= day:
+                result["next_at"] = midnight
+            if source["account_id"] is not None:
+                fields = "day,time,bonus,uploaded,downloaded,ratio"
+                values = (origin, source["account_id"])
+                latest = db.execute(f"SELECT {fields} FROM account_snapshots WHERE origin=? AND account_id=? ORDER BY day DESC LIMIT 1", values).fetchone()
+                result["latest"] = dict(latest) if latest else None
+                result["history"] = [dict(row) for row in db.execute(f"SELECT {fields} FROM account_snapshots WHERE origin=? AND account_id=? AND day>=? ORDER BY day", (*values, since))]
+        return result
+
+    def begin_account_sample(self, settings, zone, now):
+        if not settings["url"] or not settings["api_key"]:
+            return False
+        origin, fingerprint = account_source(settings)
+        day, midnight = account_calendar(zone, now)
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            source = db.execute("SELECT * FROM account_sources WHERE fingerprint=?", (fingerprint,)).fetchone()
+            if source is not None:
+                if source["timezone"] == zone and source["next_at"] > now:
+                    return False
+                if source["timezone"] != zone and account_calendar(zone, source["last_attempt_at"])[0] >= day:
+                    return False
+            db.execute("""INSERT INTO account_sources(fingerprint,origin,last_attempt_at,next_at,timezone,error)
+                VALUES(?,?,?,?,?,?) ON CONFLICT(fingerprint) DO UPDATE SET
+                last_attempt_at=excluded.last_attempt_at,next_at=excluded.next_at,timezone=excluded.timezone,error=excluded.error""",
+                (fingerprint, origin, now, midnight, zone, "统计采样已开始；若进程中断，将保留上次成功数据并于下次午夜再采样"))
+        return True
+
+    def finish_account_sample(self, settings, zone, attempted_at, profile=None, error=""):
+        origin, fingerprint = account_source(settings)
+        day, _ = account_calendar(zone, attempted_at)
+        with self.connection() as db:
+            if profile is not None:
+                keys = ("bonus", "uploaded", "downloaded", "ratio")
+                db.execute("""INSERT INTO account_snapshots VALUES(?,?,?,?,?,?,?,?)
+                    ON CONFLICT(origin,account_id,day) DO UPDATE SET time=excluded.time,
+                    bonus=excluded.bonus,uploaded=excluded.uploaded,downloaded=excluded.downloaded,ratio=excluded.ratio""",
+                    (origin, profile["account_id"], day, attempted_at, *[profile[key] for key in keys]))
+                db.execute("UPDATE account_sources SET account_id=?,error='' WHERE fingerprint=?",
+                           (profile["account_id"], fingerprint))
+            else:
+                db.execute("UPDATE account_sources SET error=? WHERE fingerprint=?", (self.redact(error), fingerprint))
+
     def finish_run(self, run):
-        if run["kind"] == "collect" and run["status"] == "succeeded":
+        if run["kind"] in ("collect", "account") and run["status"] == "succeeded":
             return  # routine samples already live in history; don't bury user-triggered runs
         cleaned = self.redact(run)
         keys = ("id", "kind", "source", "started_at", "finished_at", "status", "message")

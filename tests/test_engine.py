@@ -70,6 +70,10 @@ class Simulator:
         self.headers = []
         self.files_status = 200
         self.search_delay = 0
+        self.profile_delay = 0
+        self.profile_data = {"id": "100", "memberCount": {
+            "bonus": "1000.25", "uploaded": str(5 * GIB), "downloaded": str(GIB), "shareRate": "5.0",
+        }}
         self.statuses = {}
         self.add_delay = 0
         self.disconnect_add = False
@@ -120,6 +124,9 @@ class Simulator:
                                  "status": {"discount": "NORMAL", "seeders": 1, "leechers": 2,
                                             "discountEndTime": "2099-01-01 00:00:00"}})
                     self.reply({"code": "SUCCESS", "data": {"data": rows}})
+                elif path == "/api/member/profile":
+                    time.sleep(fixture.profile_delay)
+                    self.reply({"code": "SUCCESS", "data": fixture.profile_data})
                 elif path == "/api/torrent/genDlToken":
                     identity = data["id"][0]
                     self.reply({"code": "SUCCESS", "data": fixture.url + f"/redirect/{identity}?token=secret-download"})
@@ -254,6 +261,101 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(add_outcome(200, b'{"success_count":0,"pending_count":0,"failure_count":1}'), "rejected")
         self.assertEqual(add_outcome(202, b'{"success_count":0,"pending_count":1,"failure_count":0}'), "uncertain")
 
+    def test_mteam_profile_preserves_byte_integers_and_site_ratio(self):
+        mt = self.engine._mt()
+        self.addCleanup(mt.close)
+        self.assertEqual(mt.profile(), {"account_id": "100", "bonus": 1000.25,
+                                        "uploaded": 5 * GIB, "downloaded": GIB, "ratio": 5.0})
+        self.sim.profile_data["id"] = 100
+        self.sim.profile_data["memberCount"].update(uploaded=2**53 + 1, downloaded=str(2**63 - 1), shareRate="1.25")
+        profile = mt.profile()
+        self.assertEqual(profile["account_id"], "100")
+        self.assertEqual(profile["uploaded"], 2**53 + 1)
+        self.assertEqual(profile["downloaded"], 2**63 - 1)
+        self.assertIs(type(profile["uploaded"]), int)
+        self.assertIs(type(profile["downloaded"]), int)
+        self.assertEqual(profile["ratio"], 1.25)
+        self.assertEqual(self.sim.calls, ["/api/member/profile"] * 2)
+        self.assertEqual(self.sim.headers[0][1]["x-api-key"], self.config["mteam"]["api_key"])
+
+    def test_mteam_profile_rejects_missing_and_malformed_fields_without_zero_defaults(self):
+        mt = self.engine._mt()
+        self.addCleanup(mt.close)
+        valid = deepcopy(self.sim.profile_data)
+        malformed = [None, [], {}, {"id": "100"}, {"id": "100", "memberCount": []}]
+        for identity in (None, "", " ", True, [], {}, -1, 1.5):
+            malformed.append({**valid, "id": identity})
+        for key in ("bonus", "uploaded", "downloaded", "shareRate"):
+            missing = deepcopy(valid)
+            del missing["memberCount"][key]
+            malformed.append(missing)
+        for key, value in (("bonus", None), ("bonus", True), ("bonus", "NaN"), ("bonus", "Infinity"),
+                           ("bonus", "-1"), ("uploaded", 1.5), ("uploaded", "1.0"), ("uploaded", True),
+                           ("uploaded", "private-account-value"), ("uploaded", str(2**63)),
+                           ("downloaded", -1), ("downloaded", None), ("shareRate", "Infinity"),
+                           ("shareRate", "NaN"), ("shareRate", "-1")):
+            invalid = deepcopy(valid)
+            invalid["memberCount"][key] = value
+            malformed.append(invalid)
+        for payload in malformed:
+            with self.subTest(payload=payload), self.assertRaisesRegex(IntegrationError, "mteam.account"):
+                self.sim.profile_data = payload
+                mt.profile()
+        self.assertNotIn("private-account-value", json.dumps(self.store.events(limit=1000)))
+
+    def test_mteam_profile_zero_download_only_allows_undefined_or_infinite_ratio(self):
+        mt = self.engine._mt()
+        self.addCleanup(mt.close)
+        counts = self.sim.profile_data["memberCount"]
+        counts["downloaded"] = "0"
+        for ratio in (None, "", "∞", "Infinity", "+inf", float("inf")):
+            with self.subTest(ratio=ratio):
+                counts["shareRate"] = ratio
+                self.assertIsNone(mt.profile()["ratio"])
+        for ratio in ("0", "7.25"):
+            counts["shareRate"] = ratio
+            self.assertEqual(mt.profile()["ratio"], float(ratio))
+        for ratio in ("not-a-ratio", "NaN", "-Infinity", "1e309", False):
+            with self.subTest(ratio=ratio), self.assertRaisesRegex(IntegrationError, "shareRate"):
+                counts["shareRate"] = ratio
+                mt.profile()
+        del counts["shareRate"]
+        with self.assertRaisesRegex(IntegrationError, "shareRate"):
+            mt.profile()
+
+    def test_mteam_profile_envelope_errors_do_not_log_external_payloads(self):
+        mt = self.engine._mt()
+        self.addCleanup(mt.close)
+        events = []
+        mt.emit = lambda *event: events.append(event)
+        envelope = {"code": "SUCCESS", "message": "private-account-payload", "data": self.sim.profile_data}
+        with patch("ptflow.integrations.request", return_value=(200, json.dumps(envelope).encode())):
+            self.assertEqual(mt.profile()["bonus"], 1000.25)
+        envelope["code"] = {"private-account-payload": self.config["mteam"]["api_key"]}
+        with patch("ptflow.integrations.request", return_value=(200, json.dumps(envelope).encode())):
+            with self.assertRaisesRegex(IntegrationError, "站点业务失败"):
+                mt.profile()
+        logs = json.dumps(events)
+        self.assertNotIn("private-account-payload", logs)
+        self.assertNotIn(self.config["mteam"]["api_key"], logs)
+        self.assertNotIn("memberCount", logs)
+
+    def test_qb_optional_total_size_requires_bounded_integer_bytes(self):
+        row = {"hash": "a" * 40, "state": "stoppedDL", "category": "ptflow",
+               "size": 1, "progress": 0, "upspeed": 0, "dlspeed": 0,
+               "uploaded": 0, "downloaded": 0, "ratio": 0, "added_on": 0}
+        self.sim.rows[row["hash"]] = row
+        qb = self.engine._qb()
+        self.addCleanup(qb.close)
+        self.assertNotIn("total_size", qb.torrents()[0])
+        for size in (0, 32 * MIB, 2**53 + 1, 2**63 - 1):
+            row["total_size"] = size
+            self.assertEqual(qb.torrents()[0]["total_size"], size)
+        for size in (None, True, -1, 1.5, 1.0, "32", float("nan"), float("inf"), 2**63):
+            with self.subTest(size=size), self.assertRaisesRegex(IntegrationError, "total_size"):
+                row["total_size"] = size
+                qb.torrents()
+
     def test_real_query_download_confirm_and_priority_before_start(self):
         self.query()
         outcome = self.engine.brush()
@@ -314,6 +416,11 @@ class EngineTests(unittest.TestCase):
                                          "NO_PROXY": "*", "no_proxy": "*"}):
                 self.query()
                 self.assertEqual(self.engine.brush()["counts"]["submitted"], 2)
+                mt = self.engine._mt()
+                try:
+                    self.assertEqual(mt.profile()["bonus"], 1000.25)
+                finally:
+                    mt.close()
             self.assertEqual(self.sim.resume_sizes, [32 * MIB, 32 * MIB])
             for path, headers in self.sim.headers:
                 if path.startswith(("/redirect/", "/download/")):

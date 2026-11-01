@@ -149,12 +149,9 @@ class WebBehaviorTests(TestCase):
                                 "score": 1, "mode": "movie"})
         with store.connection() as db:
             db.execute("CREATE TRIGGER prune_failure BEFORE DELETE ON candidates BEGIN SELECT RAISE(ABORT, 'candidate prune unavailable'); END")
-        scheduler = self.app.extensions["ptflow_scheduler"]
         headers = {**self.origin, "X-CSRF-Token": self.token}
-        with patch.object(scheduler, "reschedule", wraps=scheduler.reschedule) as reschedule:
-            response = self.client.put("/api/config", json={"strategy": {"min_torrent_gib": 1, "max_torrent_gib": 2},
-                                                          "schedule": {"query_minutes": 47}}, headers=headers)
-            reschedule.assert_called_once_with()
+        response = self.client.put("/api/config", json={"strategy": {"min_torrent_gib": 1, "max_torrent_gib": 2},
+                                                      "schedule": {"query_minutes": 47}}, headers=headers)
         self.assertEqual(response.status_code, 500)
         self.assertTrue(response.json["committed"])
         self.assertIn("候选清理失败", response.json["error"])

@@ -123,8 +123,8 @@ def check_package(package):
                 while time.monotonic() < deadline:
                     status, state = api("status")
                     assert status == 200, state
-                    collect = next(item for item in state["schedules"] if item["kind"] == "collect")
-                    if state["current_run"] is None and state["sample"] and collect["next_at"] > state["now"]:
+                    maintenance = [item for item in state["schedules"] if item["kind"] in {"collect", "account"} and item["next_at"]]
+                    if state["current_run"] is None and state["sample"] and all(item["next_at"] > state["now"] for item in maintenance):
                         break
                     time.sleep(0.1)
                 else:
@@ -209,6 +209,7 @@ finally:
                     assert request(prefix + "/")[0] == 200
                     assert request(prefix + "/static/app.js")[0] == 200
                     assert request(prefix + "/api/config")[0] == 401
+                    assert request(prefix + "/api/mteam/stats")[0] == 401
                 status, auth = api("auth")
                 assert status == 200 and auth["setup_required"]
                 csrf = auth["csrf_token"]
@@ -227,6 +228,24 @@ finally:
                     "strategy": {"min_free_gib": 1, "max_downloading": 1,
                                  "min_torrent_gib": 0, "max_torrent_gib": 12 / 1024}})
                 assert status == 200 and configuration["schedule"]["query_minutes"] == 77
+                deadline = time.monotonic() + 30
+                while time.monotonic() < deadline:
+                    status, mt_statistics = api("mteam/stats")
+                    assert status == 200, mt_statistics
+                    if mt_statistics["latest"] is not None:
+                        break
+                    time.sleep(0.1)
+                else:
+                    raise AssertionError(f"Initial MT daily sampling did not finish: {mt_statistics}")
+                mt_snapshot = mt_statistics["latest"]
+                assert {key: mt_snapshot[key] for key in ("bonus", "uploaded", "downloaded", "ratio")} == {
+                    "bonus": 1000.25, "uploaded": 5 * 1024**3, "downloaded": 1024**3, "ratio": 5.0}
+                assert mt_statistics["history"] == [mt_snapshot]
+                profile_calls = simulator.calls.count("/api/member/profile")
+                assert profile_calls == 1
+                for _ in range(3):
+                    assert api("mteam/stats")[1]["latest"] == mt_snapshot
+                assert simulator.calls.count("/api/member/profile") == profile_calls
                 # A 32MiB package cannot enter the candidate list under a 12MiB total cap.
                 assert run("query")["counts"]["query"]["persisted"] == 0
                 run("brush", "skipped")
@@ -247,6 +266,10 @@ finally:
                 submitted = [item for item in candidates["items"] if item["state"] == "submitted"]
                 assert len(submitted) == 1 and submitted[0]["qb_hash"] in simulator.rows
                 assert len(api("torrents")[1]["items"]) == 1
+                # A legacy selected subset must not shrink the reported whole managed capacity.
+                qb_row = simulator.rows[submitted[0]["qb_hash"]]
+                qb_row.update(size=12 * 1024**2, total_size=32 * 1024**2)
+                assert api("torrents")[1]["items"][0]["size"] == 32 * 1024**2
                 # Tightening the total cap hides/prunes unowned candidates, not the owned qB job.
                 status, configuration = api("config", "PUT", {
                     "strategy": {"min_torrent_gib": 0, "max_torrent_gib": 12 / 1024}})
@@ -297,6 +320,9 @@ finally:
                 status, auth = api("login", "POST", {"password": password})
                 assert status == 200, auth
                 csrf = auth["csrf_token"]
+                assert api("mteam/stats")[1]["latest"] == mt_snapshot
+                assert api("mteam/stats")[1]["history"] == [mt_snapshot]
+                assert simulator.calls.count("/api/member/profile") == profile_calls
                 lifecycle("stop")
                 with sqlite3.connect(private / "ptflow.sqlite3") as database:
                     assert database.execute("SELECT id,qb_hash,state FROM candidates ORDER BY id").fetchall() == ownership
@@ -388,7 +414,7 @@ finally:
                 assert unrelated.read_bytes() == b"not PTFlow application data"
                 assert simulator.calls == before_calls and simulator.rows == qb_rows
                 assert (sentinel.read_bytes(), sentinel.stat().st_uid, sentinel.stat().st_mode) == sentinel_snapshot
-                print(f"PASS {package.name}: real cmd install/repeated start-stop/upgrade/reinstall; inclusive whole-torrent bounds reject oversized results before persistence, full-package disk hold and all-files start; both gateway paths, administrator setup, retained credentials/SQLite ownership; private permissions, bounded log, stale/corrupt/foreign PID safety, symlink refusal, failed-start cleanup; explicit app-only deletion and no uninstall qB calls (loopback simulator, not fnOS manager)")
+                print(f"PASS {package.name}: real cmd install/repeated start-stop/upgrade/reinstall; inclusive whole-torrent bounds and full-package disk/all-files start; first MT daily profile through real HTTP, cache-only reads and snapshot retained without same-day refetch after upgrade; whole managed capacity despite legacy selected subset; both gateway paths, administrator setup, retained credentials/SQLite ownership; private permissions, bounded log, stale/corrupt/foreign PID safety, symlink refusal, failed-start cleanup; explicit app-only deletion and no uninstall qB calls (loopback simulator, not fnOS manager)")
             finally:
                 if record_path.is_symlink():
                     record_path.unlink()

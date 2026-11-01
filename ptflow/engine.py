@@ -97,23 +97,12 @@ class Engine:
     def _mt(self):
         return MTeam(self.config["mteam"], self._event)
 
-    def _reason(self, identity, message, *, state=None):
-        safe = self.store.redact(str(message))
-        self.store.update_candidate(identity, reason=safe, **({"state": state} if state else {}))
-        self._event("WARNING", "candidate", safe, {"id": identity, "state": state or "unchanged"})
-
-    def query(self):
-        self._event("INFO", "query", "串行查询 Free 候选；入库不等于提交下载器")
-        minimum_size, maximum_size = torrent_size_bounds(self.strategy)
-        self.store.prune_candidates(minimum_size, maximum_size)
-        mt = self._mt()
-        settings = self.config["mteam"]
-        counts = {"returned": 0, "persisted": 0, "skipped": 0, "failed": 0, "protection_failed": 0}
+    def _start_site_protection(self, counts):
         stopped, protector = Event(), None
         run_id = getattr(self.store.context, "run_id", "")
 
         def protect():
-            # Only queries overlap maintenance; QB add/delete jobs remain single-flight.
+            # Read-only site HTTP overlaps Free maintenance; QB add/delete stays single-flight.
             engine = Engine(self.config, self.store, lambda stage, message: None)
             with self.store.run_context(run_id):
                 while not stopped.wait(self.config["schedule"]["stats_seconds"]):
@@ -129,13 +118,61 @@ class Engine:
                         except Exception as log_error:
                             logging.getLogger(__name__).error(self.store.redact(f"Free 保护错误日志持久化失败：{type(log_error).__name__}：{log_error}"))
 
+        if self.config["downloader"]["url"] and self.store.summary()["submitted"]:
+            protector = Thread(target=protect, name="ptflow-site-protection", daemon=True)
+            protector.start()
+        return stopped, protector
+
+    def account(self):
+        settings, zone = self.config["mteam"], self.config["schedule"]["timezone"]
+        attempted_at = time.time()
+        counts = {"sampled": 0, "failed": 0, "protection_failed": 0}
+        if not self.store.begin_account_sample(settings, zone, attempted_at):
+            return result("skipped", "MT 未配置或今日已尝试采样；未重复请求站点", **counts)
+        mt, stopped, protector = None, Event(), None
+        try:
+            stopped, protector = self._start_site_protection(counts)
+            mt = self._mt()
+            profile = mt.profile()
+            self.store.finish_account_sample(settings, zone, attempted_at, profile=profile)
+            counts["sampled"] = 1
+        except Exception as error:
+            counts["failed"] = 1
+            message = self.store.redact(f"MT 每日统计失败：{type(error).__name__}：{error}")
+            self.store.finish_account_sample(settings, zone, attempted_at, error=message)
+            self._event("ERROR", "mteam.account", message)
+        finally:
+            stopped.set()
+            if protector is not None:
+                protector.join()
+            if mt is not None:
+                mt.close()
+        if counts["failed"]:
+            return result("failed", message + "；保留上次成功数据，下次午夜再采样", **counts)
+        message = "MT 每日统计已保存；未新增下载器任务"
+        if counts["protection_failed"]:
+            message += f"；Free 保护检查失败 {counts['protection_failed']} 次，请检查下载器状态"
+        return result("partial" if counts["protection_failed"] else "succeeded", message, **counts)
+
+    def _reason(self, identity, message, *, state=None):
+        safe = self.store.redact(str(message))
+        self.store.update_candidate(identity, reason=safe, **({"state": state} if state else {}))
+        self._event("WARNING", "candidate", safe, {"id": identity, "state": state or "unchanged"})
+
+    def query(self):
+        self._event("INFO", "query", "串行查询 Free 候选；入库不等于提交下载器")
+        minimum_size, maximum_size = torrent_size_bounds(self.strategy)
+        self.store.prune_candidates(minimum_size, maximum_size)
+        mt = self._mt()
+        settings = self.config["mteam"]
+        counts = {"returned": 0, "persisted": 0, "skipped": 0, "failed": 0, "protection_failed": 0}
+        stopped, protector = Event(), None
+
         try:
             modes = settings["modes"]
             if not modes:
                 return result("skipped", "没有启用查询分类", **counts)
-            if self.config["downloader"]["url"] and self.store.summary()["submitted"]:
-                protector = Thread(target=protect, name="ptflow-query-protection", daemon=True)
-                protector.start()
+            stopped, protector = self._start_site_protection(counts)
             for index, mode in enumerate(modes):
                 if index:
                     delay = settings["request_interval_seconds"]
@@ -265,7 +302,7 @@ class Engine:
             for row, record in owned(rows, self.store.candidates(limit=100000)):
                 items.append({
                     "hash": row["hash"], "id": record["id"], "name": row.get("name", record["name"]),
-                    "size": row.get("size", record["size"]), "progress": min(1, max(0, row.get("progress", 0))),
+                    "size": row.get("total_size", record["size"]), "progress": min(1, max(0, row.get("progress", 0))),
                     "state": row.get("state", "unknown"), "upspeed": row.get("upspeed", 0),
                     "dlspeed": row.get("dlspeed", 0), "uploaded": row.get("uploaded", 0),
                     "downloaded": row.get("downloaded", 0), "ratio": row.get("ratio", 0),

@@ -3,11 +3,12 @@
   const $ = id => document.getElementById(id);
   const apiBase = new URL('./api/', location.href.split('#')[0]);
   const pages = {overview:'总览',torrents:'托管种子',candidates:'候选池',logs:'运行日志',settings:'设置'};
-  const kinds = {full:'完整运行',query:'查询候选',brush:'执行刷流',cleanup:'清理检查',collect:'统计采样'};
+  const kinds = {full:'完整运行',query:'查询候选',brush:'执行刷流',cleanup:'清理检查',collect:'统计采样',account:'MT 每日统计'};
   const settingsAnchors = ['connections','schedule-settings','strategy-settings','security-settings','qb-url','qb-username','qb-password','qb-api-key','mt-api-key'];
   const statuses = {succeeded:'成功',partial:'部分完成',skipped:'已跳过',failed:'失败',pending:'待处理',submitted:'已确认',uncertain:'待核实',removed:'已移除',running:'运行中'};
+  for (const stage of ['account','mteam.account']) $('log-stages').append(new Option(stage,stage));
   const knownStages = new Set([...$('log-stages').options].map(option => option.value));
-  const state = {csrf:'',authenticated:false,setup:false,page:'overview',config:null,secretFields:[],dirty:false,revision:0,status:null,clockOffset:0,torrents:[],candidates:[],runs:[],history:[],cursor:0,logGeneration:0,logLoading:false,logPaused:false,logCount:0,polling:false,timer:null,lastData:0,authLoading:false,toastTimer:null,busyRun:false,manualRun:null};
+  const state = {csrf:'',authenticated:false,setup:false,page:'overview',config:null,secretFields:[],dirty:false,revision:0,status:null,clockOffset:0,torrents:[],torrentsLoaded:false,torrentsError:'',torrentsAt:null,mteam:null,mteamError:'',dataGeneration:0,candidates:[],runs:[],history:[],cursor:0,logGeneration:0,logLoading:false,logPaused:false,logCount:0,polling:false,timer:null,lastData:0,authLoading:false,toastTimer:null,busyRun:false,manualRun:null};
   const escape = value => String(value ?? '').replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
   const now = () => Date.now() + state.clockOffset;
   const epoch = value => typeof value === 'number' ? value * 1000 : Date.parse(value);
@@ -156,6 +157,14 @@
     state.status = null;
     state.config = null;
     state.torrents = [];
+    state.torrentsLoaded = false;
+    state.torrentsError = '';
+    state.torrentsAt = null;
+    state.mteam = null;
+    state.mteamError = '';
+    state.dataGeneration++;
+    renderMTeam();
+    renderManagedSize();
     state.candidates = [];
     state.runs = [];
     state.manualRun = null;
@@ -204,6 +213,16 @@
   function acceptConfig(result,fill=false) {
     state.secretFields = result.secret_fields || [];
     state.config = Object.fromEntries(Object.entries(result).filter(([key]) => key !== 'secret_fields'));
+    state.dataGeneration++;
+    state.mteam = null;
+    state.mteamError = '';
+    state.torrents = [];
+    state.torrentsLoaded = false;
+    state.torrentsError = '';
+    state.torrentsAt = null;
+    state.lastData = 0;
+    renderMTeam();
+    renderManagedSize();
     if (fill) {
       for (const input of $('settings-form').querySelectorAll('[name]')) {
         const [section,field] = input.name.split('.');
@@ -401,12 +420,11 @@
     $('download-total').textContent = '累计 '+sizeText(status.sample?.downloaded);
     $('disk-protection').textContent = state.config ? `低于 ${number(state.config.strategy.min_free_gib,1)} GiB 时停止添加` : '尚未读取保护阈值';
     const summary = status.summary || {};
-    $('managed-count').textContent = number(summary.submitted);
+    renderManagedSize();
     $('nav-managed').textContent = number(summary.submitted);
-    $('managed-summary').textContent = `待处理 ${number(summary.pending)} · 待核实 ${number(summary.uncertain)} · 失败 ${number(summary.failed)}`;
     $('schedule-timezone').textContent = `${status.timezone} · ${state.config ? state.config.schedule.work_start === state.config.schedule.work_end ? '全天运行' : state.config.schedule.work_start+'–'+state.config.schedule.work_end : '读取时段中'}`;
-    const symbols = {query:'⌕',brush:'↓',cleanup:'◷',collect:'∿'};
-    $('schedule-list').innerHTML = (status.schedules || []).map(schedule => `<div class="schedule-item"><div class="schedule-item-label"><span aria-hidden="true">${symbols[schedule.kind] || '·'}</span><div>${escape(schedule.label || kinds[schedule.kind] || schedule.kind)}<small>每 ${schedule.interval_seconds >= 60 ? number(schedule.interval_seconds / 60,1)+' 分钟' : number(schedule.interval_seconds)+' 秒'}</small></div></div><div class="schedule-next" data-next="${escape(schedule.next_at || '')}" data-kind="${escape(schedule.kind)}"></div></div>`).join('') || '<p class="muted">暂无计划</p>';
+    const symbols = {query:'⌕',brush:'↓',cleanup:'◷',collect:'∿',account:'◇'};
+    $('schedule-list').innerHTML = (status.schedules || []).map(schedule => `<div class="schedule-item"><div class="schedule-item-label"><span aria-hidden="true">${symbols[schedule.kind] || '·'}</span><div>${escape(schedule.label || kinds[schedule.kind] || schedule.kind)}<small>${schedule.kind === 'account' ? '首次采样及每日 00:00' : '每 '+(schedule.interval_seconds >= 60 ? number(schedule.interval_seconds / 60,1)+' 分钟' : number(schedule.interval_seconds)+' 秒')}</small></div></div><div class="schedule-next" data-next="${escape(schedule.next_at || '')}" data-kind="${escape(schedule.kind)}"></div></div>`).join('') || '<p class="muted">暂无计划</p>';
     $('current-run').hidden = !status.current_run;
     if (status.current_run) {
       const run = status.current_run;
@@ -427,7 +445,7 @@
     document.querySelectorAll('[data-next]').forEach(element => {
       const next = element.dataset.next;
       const disabledCleanup = element.dataset.kind === 'cleanup' && state.config && !state.config.strategy.cleanup_enabled;
-      const label = state.config && !state.config.downloader.url ? '未配置下载器' : disabledCleanup ? '仅 Free 保护' : ['query','brush'].includes(element.dataset.kind) && state.status?.enabled && !state.status.working_time ? '工作时段外' : next ? countdown(next) : state.status?.enabled || element.dataset.kind === 'collect' ? '等待调度' : '已暂停';
+      const label = element.dataset.kind === 'account' ? state.secretFields.includes('mteam.api_key') ? next ? countdown(next) : '等待调度' : '未配置 M-Team' : state.config && !state.config.downloader.url ? '未配置下载器' : disabledCleanup ? '仅 Free 保护' : ['query','brush'].includes(element.dataset.kind) && state.status?.enabled && !state.status.working_time ? '工作时段外' : next ? countdown(next) : state.status?.enabled || element.dataset.kind === 'collect' ? '等待调度' : '已暂停';
       element.innerHTML = `${escape(label)}${next ? `<small title="${escape(date(next,true))}">${escape(date(next))}</small>` : ''}`;
     });
     if (state.status?.sample) {
@@ -526,16 +544,84 @@
     $('chart-container').innerHTML = `<svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" role="img" aria-label="${escape(`${items.length} 个真实采样的全局传输趋势；最新上传 ${sizeText(latest.upspeed,true)}，下载 ${sizeText(latest.dlspeed,true)}`)}"><title>全局上传与下载速度趋势，${items.length} 个真实采样</title>${grid}${lines}${labels}</svg>`;
   }
   $('history-period').addEventListener('change',loadHistory);
+  async function loadMTeam() {
+    const generation = state.dataGeneration, days = $('mt-period').value;
+    try {
+      const result = await request('mteam/stats?days='+days);
+      if (!state.authenticated || generation !== state.dataGeneration || days !== $('mt-period').value) return;
+      state.mteam = result;
+      state.mteamError = '';
+      renderMTeam();
+    } catch (error) {
+      if (generation !== state.dataGeneration || days !== $('mt-period').value) return;
+      state.mteamError = error.message+' 已显示的数值仅为上次成功采样。';
+      renderMTeam();
+    }
+  }
+  function renderMTeam() {
+    const data = state.mteam, sample = data?.latest;
+    $('mt-bonus').textContent = number(sample?.bonus,2);
+    metric('mt-uploaded',sample?.uploaded);
+    metric('mt-downloaded',sample?.downloaded);
+    $('mt-ratio').textContent = sample ? sample.ratio === null ? sample.downloaded === 0 && sample.uploaded > 0 ? '∞' : '—' : number(sample.ratio,3) : '—';
+    const zone = state.status?.timezone || state.config?.schedule.timezone || 'Asia/Shanghai';
+    $('mt-sample-note').textContent = data?.configured === false ? '尚未配置 M-Team API Key，请在设置中保存。' : `每天按 ${zone} 00:00 采样${sample ? ' · 上次成功 '+date(sample.time,true)+'（'+sample.day+'）' : ' · 等待首次成功采样'}${data?.next_at ? ' · 下次 '+date(data.next_at,true) : ''}。历史从首次成功采样开始，不补造以前的数据。`;
+    showMessage('mt-error',state.mteamError || (data?.error ? data.error+' '+(sample ? '已保留上次成功采样，当前值可能已过期。' : '尚无成功采样，当前不会显示为零。') : ''));
+    $('mt-sample-note').classList.toggle('stale',Boolean(state.mteamError || data?.error));
+    renderMTeamChart();
+  }
+  function renderMTeamChart() {
+    const key = $('mt-metric').value;
+    const label = $('mt-metric').selectedOptions[0].textContent;
+    const items = (state.mteam?.history || []).filter(item => Number.isFinite(Date.parse(item.day+'T00:00:00Z')) && item[key] !== null && Number.isFinite(Number(item[key])));
+    $('mt-chart-count').textContent = items.length ? items.length+' 个每日真实采样' : '';
+    if (!items.length) { $('mt-chart').innerHTML = `<div class="empty-state"><span class="empty-symbol">∿</span><strong>暂无${escape(label)}历史采样</strong><p>首次成功后显示真实点；缺失日期与无限分享率不补成零。</p></div>`; return; }
+    const width = Math.max(300,$('mt-chart').clientWidth), height = $('mt-chart').clientHeight || 220, left = 64, right = 18, top = 14, bottom = 30;
+    const first = Date.parse(items[0].day+'T00:00:00Z'), last = Date.parse(items.at(-1).day+'T00:00:00Z');
+    const values = items.map(item => Number(item[key]));
+    const minimum = Math.min(...values), maximum = Math.max(...values);
+    const padding = Math.max(Number.EPSILON,(maximum-minimum || maximum || 1)*.08);
+    const low = Math.max(0,minimum-padding), high = Math.min(Number.MAX_VALUE,maximum+padding);
+    const x = item => first === last ? (left+width-right)/2 : left+(Date.parse(item.day+'T00:00:00Z')-first)/(last-first)*(width-left-right);
+    const y = item => top+(1-(Number(item[key])-low)/(high-low))*(height-top-bottom);
+    const format = value => ['uploaded','downloaded'].includes(key) ? sizeText(value) : number(value,key === 'ratio' ? 3 : 2);
+    let grid = '', labels = '';
+    for (let i=0;i<=4;i++) { const py = top+(height-top-bottom)*i/4; grid += `<line class="chart-grid" x1="${left}" y1="${py}" x2="${width-right}" y2="${py}"/><text class="chart-label" x="${left-8}" y="${py+3}" text-anchor="end">${escape(format(low+(high-low)*(4-i)/4))}</text>`; }
+    const points = items.map(item => `${x(item).toFixed(2)},${y(item).toFixed(2)}`).join(' ');
+    const ticks = items.length < 3 ? items : [items[0],items[Math.floor((items.length-1)/2)],items.at(-1)];
+    ticks.forEach((item,index) => { labels += `<text class="chart-label" x="${x(item)}" y="${height-7}" text-anchor="${ticks.length === 1 ? 'middle' : index === 0 ? 'start' : index === ticks.length-1 ? 'end' : 'middle'}">${escape(item.day.slice(5))}</text>`; });
+    const dots = items.map(item => `<circle cx="${x(item)}" cy="${y(item)}" r="3" fill="var(--primary)"><title>${escape(item.day+' · '+label+' '+format(item[key]))}</title></circle>`).join('');
+    $('mt-chart').innerHTML = `<svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" role="img" aria-label="${escape(label+'，'+items.length+' 个每日采样，最新 '+format(items.at(-1)[key]))}"><title>${escape('M-Team '+label+'每日历史；纵轴按实际值范围缩放')}</title>${grid}${items.length > 1 ? `<polyline class="chart-upload" points="${points}"/>` : ''}${dots}${labels}</svg>`;
+  }
+  $('mt-period').addEventListener('change',loadMTeam);
+  $('mt-metric').addEventListener('change',renderMTeamChart);
+  new ResizeObserver(renderMTeamChart).observe($('mt-chart'));
+  function renderManagedSize() {
+    metric('managed-size',state.torrentsLoaded ? state.torrents.reduce((total,item) => total+Number(item.size),0) : null);
+    $('managed-summary').textContent = state.torrentsLoaded ? `${state.torrentsError ? '上次确认' : '已确认'} ${number(state.torrents.length)} 个 · 整包大小非磁盘占用` : '等待下载器确认 · 不计待处理或待核实候选';
+    $('managed-summary').title = state.torrentsAt ? '最后确认 '+date(state.torrentsAt,true) : '';
+    showMessage('managed-error',state.torrentsError);
+  }
   async function loadTorrents() {
+    const generation = state.dataGeneration;
     try {
       const result = await request('torrents');
-      if (!state.authenticated) return;
-      if (result.error) { showMessage('torrents-error',result.error+' 上次成功列表已保留，不代表下载器当前状态。'); return; }
+      if (!state.authenticated || generation !== state.dataGeneration) return;
+      if (result.error) throw new Error(result.error);
       state.torrents = result.items || [];
+      state.torrentsLoaded = true;
+      state.torrentsError = '';
+      state.torrentsAt = Date.now()/1000;
       renderTorrents();
+      renderManagedSize();
       showMessage('torrents-error','');
-      $('torrents-updated').textContent = `最后更新 ${date(new Date().toISOString(),true)} · 托管任务速率不等于下载器全局速率。`;
-    } catch (error) { showMessage('torrents-error',error.message+' 上次成功列表已保留。'); }
+      $('torrents-updated').textContent = `最后更新 ${date(state.torrentsAt,true)} · 种子大小为整包总大小；非磁盘占用。托管任务速率不等于下载器全局速率。`;
+    } catch (error) {
+      if (generation !== state.dataGeneration) return;
+      state.torrentsError = error.message+' '+(state.torrentsLoaded ? '上次确认容量与列表已保留，不代表当前状态。' : '尚未确认当前容量。');
+      showMessage('torrents-error',state.torrentsError);
+      renderManagedSize();
+    }
   }
   function freeText(value) {
     if (!value || !Number.isFinite(epoch(value))) return '<span class="muted">未知</span>';
@@ -667,7 +753,7 @@
     finally { button.disabled = false; }
   });
   async function loadPageData() {
-    if (state.page === 'overview') await Promise.all([loadHistory(),loadRuns()]);
+    if (state.page === 'overview') await Promise.all([loadHistory(),loadRuns(),loadMTeam(),loadTorrents()]);
     else if (state.page === 'torrents') { renderTorrents(); await loadTorrents(); }
     else if (state.page === 'candidates') { renderCandidates(); await loadCandidates(); }
     else if (state.page === 'logs') await Promise.all([loadLogs(),loadRuns()]);

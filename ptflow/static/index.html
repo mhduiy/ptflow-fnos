@@ -57,9 +57,22 @@
             <article class="metric-card"><div class="metric-label">全局上传速度 <span class="metric-icon upload" aria-hidden="true">↗</span></div><div class="metric-value" id="upload-speed">—</div><div class="metric-footer">qBittorrent 全部任务 <span id="upload-total">累计 —</span></div></article>
             <article class="metric-card"><div class="metric-label">全局下载速度 <span class="metric-icon download" aria-hidden="true">↙</span></div><div class="metric-value" id="download-speed">—</div><div class="metric-footer">qBittorrent 全部任务 <span id="download-total">累计 —</span></div></article>
             <article class="metric-card"><div class="metric-label">下载器可用磁盘 <span class="metric-icon neutral" aria-hidden="true">◫</span></div><div class="metric-value" id="disk-free">—</div><div class="metric-footer" id="disk-protection">保留空间保护 —</div></article>
-            <article class="metric-card"><div class="metric-label">已确认托管种子 <span class="metric-icon upload" aria-hidden="true">◇</span></div><div class="metric-value" id="managed-count">—</div><div class="metric-footer" id="managed-summary">仅 PTFlow 确认接管的任务</div></article>
+            <article class="metric-card"><div class="metric-label">托管整包总大小 <span class="metric-icon upload" aria-hidden="true">◇</span></div><div class="metric-value" id="managed-size">—</div><div class="metric-footer" id="managed-summary">等待下载器确认 · 不含其他任务</div><div id="managed-error" class="danger-text" role="status" hidden></div></article>
           </div>
           <div class="sample-note" id="sample-note">尚无下载器采样；不会使用模拟数据。</div>
+          <article class="card mt-panel" aria-labelledby="mt-title">
+            <div class="card-heading"><div><h2 id="mt-title">M-Team 每日账户统计</h2><p>MT 账户累计值 · 与下载器全局传输、工具托管容量分开统计</p></div><a href="#connections" class="text-link">连接设置 →</a></div>
+            <div class="metrics-grid">
+              <div class="metric-card"><div class="metric-label">魔力值</div><div class="metric-value" id="mt-bonus">—</div><div class="metric-footer">上次每日成功采样</div></div>
+              <div class="metric-card"><div class="metric-label">累计上传</div><div class="metric-value" id="mt-uploaded">—</div><div class="metric-footer">M-Team 全账户累计值</div></div>
+              <div class="metric-card"><div class="metric-label">累计下载</div><div class="metric-value" id="mt-downloaded">—</div><div class="metric-footer">M-Team 全账户累计值</div></div>
+              <div class="metric-card"><div class="metric-label">分享率</div><div class="metric-value" id="mt-ratio">—</div><div class="metric-footer">M-Team 返回的分享率</div></div>
+            </div>
+            <p id="mt-sample-note" class="sample-note">等待首次成功采样；不会补造以前的数据。</p>
+            <div id="mt-error" class="inline-error" role="alert" hidden></div>
+            <div class="mt-chart-heading"><span id="mt-chart-count" class="muted"></span><div class="mt-chart-controls"><label class="sr-only" for="mt-metric">MT 趋势指标</label><select id="mt-metric" class="compact-select"><option value="bonus">魔力值</option><option value="uploaded">累计上传</option><option value="downloaded">累计下载</option><option value="ratio">分享率</option></select><label class="sr-only" for="mt-period">MT 历史时间范围</label><select id="mt-period" class="compact-select"><option value="30">最近 30 天</option><option value="90" selected>最近 90 天</option><option value="365">最近一年</option></select></div></div>
+            <div id="mt-chart" class="chart-container"><div class="empty-state"><strong>等待第一份每日真实采样</strong><p>成功后显示真实点；至少两个日期才有折线。</p></div></div>
+          </article>
           <div class="overview-grid">
             <article class="card trend-card"><div class="card-heading"><div><h2>传输趋势</h2><p>全局 qBittorrent 速率 · MiB/s</p></div><label class="sr-only" for="history-period">趋势时间范围</label><select id="history-period" class="compact-select"><option value="60">最近 1 小时</option><option value="360">最近 6 小时</option><option value="1440">最近 24 小时</option></select></div><div class="chart-legend"><span><i class="legend-dot upload"></i>上传</span><span><i class="legend-dot download"></i>下载</span><span id="chart-sample-count" class="muted"></span></div><div id="chart-container" class="chart-container"><div class="empty-state"><span class="empty-symbol">∿</span><strong>等待第一份真实采样</strong><p>配置下载器后，完整运行或自动采样将绘制传输趋势。</p></div></div><div id="history-error" class="inline-error" role="alert" hidden></div></article>
             <article class="card rhythm-card"><div class="card-heading"><div><h2>运行节奏</h2><p id="schedule-timezone">按本机配置时区运行</p></div><a href="#settings" class="text-link">调整 →</a></div><div id="schedule-list" class="schedule-list"><p class="muted">正在读取计划…</p></div><div class="rhythm-footnote">手动运行绕过自动开关与工作时段，不绕过安全保护。</div></article>

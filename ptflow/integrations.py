@@ -120,18 +120,20 @@ class MTeam:
             self.session.proxies.update({"http": proxy, "https": proxy})
         self.emit = emit
 
-    def _post(self, endpoint, stage, **kwargs):
-        _, body = request(self.session, "POST", f"{self.url}/api/torrent/{endpoint}",
+    def _post(self, path, stage, **kwargs):
+        _, body = request(self.session, "POST", f"{self.url}{path}",
                           stage, self.emit, **kwargs)
         value = json_body(body, stage, dict)
         code = value.get("code")
-        self.emit("INFO", stage, "站点业务响应", {"code": code, "message": value.get("message", "")})
+        self.emit("INFO", stage, "站点业务响应", {
+            "code": code if code in (0, "0", "SUCCESS") else "非成功或缺失",
+        })
         if code not in (0, "0", "SUCCESS"):
             raise IntegrationError(f"{stage}：站点业务失败或缺少 code")
         return value.get("data")
 
     def search(self, mode, page_size):
-        data = self._post("search", "mteam.search", json={
+        data = self._post("/api/torrent/search", "mteam.search", json={
             "categories": [], "mode": mode, "visible": 1, "pageNumber": 1,
             "pageSize": page_size, "sortDirection": "DESC",
             "sortField": "CREATED_DATE", "discount": "FREE",
@@ -140,8 +142,49 @@ class MTeam:
             raise IntegrationError("mteam.search：data.data 应为种子列表")
         return data["data"]
 
+    def profile(self):
+        data = self._post("/api/member/profile", "mteam.account")
+        if not isinstance(data, dict) or not isinstance(data.get("memberCount"), dict):
+            raise IntegrationError("mteam.account：缺少或无效的 memberCount")
+        identity = data.get("id")
+        if (type(identity) not in (str, int) or not str(identity).strip()
+                or type(identity) is int and identity < 0):
+            raise IntegrationError("mteam.account：缺少或无效的 id")
+        counts = data["memberCount"]
+        result = {"account_id": str(identity).strip()}
+        for key in ("uploaded", "downloaded"):
+            value = counts.get(key)
+            if type(value) is not int and not (isinstance(value, str) and re.fullmatch(r"[0-9]+", value)):
+                raise IntegrationError(f"mteam.account：缺少或无效的字段 {key}，应为整数字节")
+            try:
+                number = int(value)
+            except ValueError:
+                raise IntegrationError(f"mteam.account：字段 {key} 超出整数字节范围") from None
+            if not 0 <= number <= 2**63 - 1:
+                raise IntegrationError(f"mteam.account：字段 {key} 超出整数字节范围")
+            result[key] = number
+        for key, source in (("bonus", "bonus"), ("ratio", "shareRate")):
+            if source not in counts:
+                raise IntegrationError(f"mteam.account：缺少字段 {source}")
+            value = counts[source]
+            if (key == "ratio" and result["downloaded"] == 0
+                    and (value is None or type(value) is float and value == math.inf
+                         or isinstance(value, str) and value.strip().lower() in ("", "∞", "inf", "+inf", "infinity", "+infinity"))):
+                result[key] = None
+                continue
+            try:
+                if type(value) not in (int, float, str):
+                    raise ValueError
+                number = float(value)
+            except (ValueError, OverflowError):
+                raise IntegrationError(f"mteam.account：字段 {source} 不是有效非负数") from None
+            if not math.isfinite(number) or number < 0:
+                raise IntegrationError(f"mteam.account：字段 {source} 不是有效非负数")
+            result[key] = number
+        return result
+
     def torrent(self, identity):
-        link = self._post("genDlToken", "mteam.token", data={"id": str(identity)})
+        link = self._post("/api/torrent/genDlToken", "mteam.token", data={"id": str(identity)})
         if not isinstance(link, str) or not link:
             raise IntegrationError("mteam.token：未返回下载链接")
         checked_url(link, https=True, query=True)
@@ -208,6 +251,8 @@ class QBittorrent:
                 value = row.get(key)
                 if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
                     raise IntegrationError(f"qb.torrents：缺少或无效的字段 {key}，不猜测空闲状态")
+            if "total_size" in row and (type(row["total_size"]) is not int or not 0 <= row["total_size"] <= 2**63 - 1):
+                raise IntegrationError("qb.torrents：无效的字段 total_size，应为整数字节，不猜测完整容量")
             if row["progress"] > 1:
                 raise IntegrationError("qb.torrents：下载进度不在 0–1 范围内")
         return rows

@@ -9,8 +9,9 @@ import uuid
 from . import __version__
 from .config import is_work_time
 from .engine import Engine
+from .store import account_calendar
 
-LABELS = {"query": "种子查询", "brush": "刷流补充", "cleanup": "安全维护", "collect": "状态采样", "full": "立即执行一次"}
+LABELS = {"query": "种子查询", "brush": "刷流补充", "cleanup": "安全维护", "collect": "状态采样", "account": "MT 每日统计", "full": "立即执行一次"}
 
 
 def iso(timestamp):
@@ -39,6 +40,8 @@ class Scheduler:
         with self.lock:
             self.deadlines = {key: now + duration for key, duration in self.intervals().items()}
             self.deadlines["collect"] = now
+            config = self.config.get()
+            self.deadlines["account"] = self.store.account_stats(config["mteam"], config["schedule"]["timezone"], days=1, now=now)["next_at"] or account_calendar(config["schedule"]["timezone"], now)[1]
         self.wakeup.set()
 
     def start(self):
@@ -57,14 +60,15 @@ class Scheduler:
             config = self.config.get()
             now = time.time()
             with self.lock:
-                due = [key for key in ("collect", "query", "brush", "cleanup") if self.deadlines[key] <= now]
+                due = [key for key in ("account", "collect", "query", "brush", "cleanup") if self.deadlines[key] <= now]
                 active = self.current is not None
             for kind in due:
                 if active:
                     break  # overdue work is retried after the current run, never piled into a queue
-                if not config["downloader"]["url"] or (kind != "collect" and not config["schedule"]["enabled"]):
+                configured = bool(config["mteam"]["url"] and config["mteam"]["api_key"]) if kind == "account" else bool(config["downloader"]["url"])
+                if not configured or (kind not in ("collect", "account") and not config["schedule"]["enabled"]):
                     with self.lock:
-                        self.deadlines[kind] = now + self.intervals(config)[kind]
+                        self.deadlines[kind] = account_calendar(config["schedule"]["timezone"], now)[1] if kind == "account" else now + self.intervals(config)[kind]
                     continue
                 if kind in ("query", "brush") and not is_work_time(config):
                     try:
@@ -83,7 +87,7 @@ class Scheduler:
             self.wakeup.clear()
 
     def submit(self, kind, source="manual"):
-        if not isinstance(kind, str) or kind not in LABELS or kind == "collect" and source == "manual":
+        if not isinstance(kind, str) or kind not in LABELS or kind in ("collect", "account") and source == "manual":
             raise ValueError("不支持的任务类型")
         with self.lock:
             if self.current is not None:
@@ -95,6 +99,8 @@ class Scheduler:
             if kind == "full":
                 for key in ("query", "brush", "cleanup", "collect"):
                     self.deadlines[key] = time.time() + self.intervals()[key]
+            elif kind == "account":
+                self.deadlines[kind] = account_calendar(self.config.get()["schedule"]["timezone"], time.time())[1]
             else:
                 self.deadlines[kind] = time.time() + self.intervals()[kind]
             self.worker = Thread(target=self._execute, args=(deepcopy(self.current),), name=f"ptflow-{kind}", daemon=True)
@@ -115,12 +121,13 @@ class Scheduler:
             logging.getLogger(__name__).error("PTFlow %s %s", run["id"], run["message"])
 
         counts, results = {}, []
+        job_config = self.config.get()
         run.update(status="failed", message="任务未完成", counts=counts)
         try:
             with self.store.run_context(run["id"]):
                 try:
                     self.store.event("INFO", "任务", f"开始{LABELS[run['kind']]}；来源={'手动' if run['source'] == 'manual' else '定时'}", details={"manual_safety": "手动执行仅跳过自动开关和工作时段，其他保护保持生效"})
-                    engine = Engine(self.config.get(), self.store, progress, self.stopping)
+                    engine = Engine(job_config, self.store, progress, self.stopping)
                     kinds = ("query", "collect", "brush", "cleanup") if run["kind"] == "full" else (run["kind"],)
                     for kind in kinds:
                         progress(LABELS[kind], f"正在执行{LABELS[kind]}")
@@ -154,9 +161,21 @@ class Scheduler:
         finally:
             run.setdefault("finished_at", time.time())
             with self.lock:
-                if run["kind"] != "collect" or run["status"] != "succeeded":
+                if run["kind"] not in ("collect", "account") or run["status"] != "succeeded":
                     self.last_run = deepcopy(run)
                 self.current = None
+                if run["kind"] == "account":
+                    config, now = self.config.get(), time.time()
+                    self.deadlines["account"] = account_calendar(config["schedule"]["timezone"], now)[1]
+                    try:
+                        stats = self.store.account_stats(config["mteam"], config["schedule"]["timezone"], days=1, now=now)
+                        next_at = stats["next_at"]
+                        same_source = all(config["mteam"][key] == job_config["mteam"][key] for key in ("url", "api_key"))
+                        attempted = stats["last_attempt_at"] is not None and stats["last_attempt_at"] >= run["started_at"]
+                        if next_at is not None and (not same_source or next_at > now or attempted):
+                            self.deadlines["account"] = next_at
+                    except Exception as error:
+                        logging.getLogger(__name__).error(self.store.redact(f"MT 统计调度状态读取失败：{type(error).__name__}：{error}"))
             self.wakeup.set()
 
     def status(self):
@@ -170,6 +189,8 @@ class Scheduler:
             if runs and (not last_run or runs[0]["started_at"] > last_run["started_at"]):
                 last_run = runs[0]
             schedules = [{"kind": key, "label": LABELS[key], "interval_seconds": duration, "next_at": iso(self.deadlines[key]) if (key == "collect" and config["downloader"]["url"] or enabled and config["downloader"]["url"]) else None} for key, duration in self.intervals(config).items()]
+            schedules.append({"kind": "account", "label": LABELS["account"], "interval_seconds": None,
+                              "next_at": iso(self.deadlines["account"]) if config["mteam"]["url"] and config["mteam"]["api_key"] else None})
         return {"version": __version__, "configured": bool(config["downloader"]["url"] and config["mteam"]["api_key"]),
                 "enabled": enabled, "working_time": is_work_time(config), "now": iso(time.time()),
                 "current_run": current, "last_run": last_run, "schedules": schedules,

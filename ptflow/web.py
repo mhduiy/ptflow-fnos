@@ -286,6 +286,14 @@ def create_app(data_dir, gateway_prefix="", start_scheduler=True):
     def history():
         return jsonify(items=store.history(integer_argument("minutes", 60, 1, 10080)))
 
+    @app.get("/api/mteam/stats")
+    def mteam_stats():
+        active = config.get()
+        stats = store.account_stats(active["mteam"], active["schedule"]["timezone"], integer_argument("days", 90, 1, 3650))
+        with scheduler.lock:
+            stats["next_at"] = scheduler.deadlines["account"] if stats["configured"] else None
+        return jsonify(stats)
+
     @app.get("/api/runs")
     def runs():
         return jsonify(items=store.runs())
