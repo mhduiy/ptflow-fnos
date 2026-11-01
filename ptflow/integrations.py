@@ -165,10 +165,11 @@ class QBittorrent:
         elif auth == "password":
             if not config.get("username") or not config.get("password"):
                 raise IntegrationError("qBittorrent 用户名或密码尚未配置")
-            _, body = self.call("auth/login", "qb.login", "POST", data={
+            status, body = self.call("auth/login", "qb.login", "POST", data={
                 "username": config["username"], "password": config["password"],
             })
-            if body.strip() != b"Ok.":
+            # Modern WebAPI uses 204; authenticated version/stats/list reads still verify access.
+            if not (status == 204 or status == 200 and body.strip() == b"Ok."):
                 raise IntegrationError("qb.login：用户名或密码被拒绝")
         else:
             raise IntegrationError("不支持的 qBittorrent 认证方式")

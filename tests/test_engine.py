@@ -52,6 +52,10 @@ class Simulator:
         self.limit_download_id = None
         self.limit_add_id = None
         self.version = "v5.2.0"
+        self.login_status = 200
+        self.login_body = b"Ok."
+        self.login_cookie = True
+        self.require_sid = False
         self.invalid_confirmation = False
         self.priority_ignored = False
         self.resume_budgets = []
@@ -112,8 +116,12 @@ class Simulator:
                     else:
                         self.reply(torrent(identity)[0])
                 elif path == "/api/v2/auth/login":
-                    self.reply(b"Ok.", headers={"Set-Cookie": "SID=secret-cookie; Path=/"})
+                    self.reply(fixture.login_body, fixture.login_status,
+                               {"Set-Cookie": "SID=secret-cookie; Path=/"} if fixture.login_cookie else {})
                 elif path == "/api/v2/app/version":
+                    if fixture.require_sid and "SID=secret-cookie" not in self.headers.get("Cookie", ""):
+                        self.reply(b"Forbidden", 403)
+                        return
                     self.reply(fixture.version.encode())
                 elif path == "/api/v2/sync/maindata":
                     self.reply({"server_state": {"up_info_speed": 0, "dl_info_speed": 0,
@@ -356,6 +364,20 @@ class EngineTests(unittest.TestCase):
         self.assertNotIn(torrent_hash, self.sim.rows)
         self.assertIn(manual["hash"], self.sim.rows)
         self.assertEqual(len(self.sim.rows), 2)
+
+    def test_password_login_versions_still_require_authenticated_api_access(self):
+        self.sim.require_sid = True
+        cases = ((200, b"Ok.", True, True), (204, b"", True, True),
+                 (200, b"Fails.", False, False), (401, b"", False, False),
+                 (204, b"", False, False))
+        for status, body, cookie, accepted in cases:
+            with self.subTest(status=status, cookie=cookie):
+                self.sim.login_status, self.sim.login_body, self.sim.login_cookie = status, body, cookie
+                if accepted:
+                    self.assertTrue(self.engine.test_connection("downloader")["ok"])
+                else:
+                    with self.assertRaises(IntegrationError):
+                        self.engine.test_connection("downloader")
 
     def test_api_key_is_bearer_and_older_password_version_uses_resume(self):
         self.config["downloader"].update(auth_type="api_key", api_key="secret-api")
