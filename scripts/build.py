@@ -53,7 +53,8 @@ def write_tar(source: Path, destination: Path):
 
     with destination.open("wb") as output, gzip.GzipFile(filename="", fileobj=output, mode="wb", mtime=epoch) as compressed:
         with tarfile.open(fileobj=compressed, mode="w", format=tarfile.GNU_FORMAT) as archive:
-            archive.add(source, arcname=".", filter=normalize)
+            for child in sorted(source.iterdir()):
+                archive.add(child, arcname=child.name, filter=normalize)
 
 
 def point_segment_distance(x, y, x1, y1, x2, y2):

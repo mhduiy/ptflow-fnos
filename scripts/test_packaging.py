@@ -80,6 +80,18 @@ class PackagingTests(unittest.TestCase):
             self.assertEqual(external.read_bytes(), b"download data")
             self.assertEqual(path.read_bytes(), b"oversized log")
 
+    def test_fpk_manifest_is_addressable_at_package_root(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            package = root / "package"
+            package.mkdir()
+            manifest = b"appname = ptflow-fnos\n"
+            (package / "manifest").write_bytes(manifest)
+            archive_path = root / "probe.fpk"
+            build.write_tar(package, archive_path)
+            with tarfile.open(archive_path, "r:gz") as archive:
+                self.assertEqual(archive.extractfile("manifest").read(), manifest)
+
     def test_generated_original_png_and_nested_app_archive(self):
         image = build.icon_png(64)
         self.assertEqual(image[:8], b"\x89PNG\r\n\x1a\n")
@@ -105,9 +117,9 @@ class PackagingTests(unittest.TestCase):
             build.write_tar(app, second)
             self.assertEqual(first.read_bytes(), second.read_bytes())
             with tarfile.open(fileobj=io.BytesIO(first.read_bytes()), mode="r:gz") as archive:
-                self.assertIn("./ui/icon.png", archive.getnames())
-                self.assertNotIn("./app/ui/icon.png", archive.getnames())
-                self.assertEqual(archive.extractfile("./ui/icon.png").read(), image)
+                restored = root / "restored"
+                archive.extractall(restored, filter="data")
+                self.assertEqual((restored / "ui/icon.png").read_bytes(), image)
 
     @unittest.skipUnless(hasattr(socketserver, "UnixStreamServer"), "Unix socket platform required")
     def test_readiness_requires_real_successful_http_response(self):

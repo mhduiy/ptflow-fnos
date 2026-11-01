@@ -11,8 +11,8 @@
 | 项目 | 说明 |
 | --- | --- |
 | 飞牛系统 | fnOS **1.1.3100 或更新版本**，使用原生应用统一网关 |
-| Intel / AMD NAS | `PTFlow_1.0.3_x86_64.fpk`，基线 x86_64，不要求 AVX |
-| ARM NAS | `PTFlow_1.0.3_arm64.fpk`，aarch64 / arm64 |
+| Intel / AMD NAS | `PTFlow_1.0.4_x86_64.fpk`，基线 x86_64，不要求 AVX |
+| ARM NAS | `PTFlow_1.0.4_arm64.fpk`，aarch64 / arm64 |
 | 站点 | M-Team API；默认 `https://api.m-team.cc` |
 | 下载器 | qBittorrent Web API；用户名/密码认证，或支持 API Key 的版本（通常为 5.2.0+） |
 | 种子格式 | BEP 3 / v1；包含 v1 infohash 的混合种子可用，纯 BitTorrent v2 明确拒绝 |
@@ -23,12 +23,14 @@
 ## 安装与升级
 
 1. 在 Releases 下载适合 CPU 的 `.fpk` 及同名 `.fpk.sha256`。
-2. 可选但推荐：在下载目录校验完整性。Linux 使用 `sha256sum -c PTFlow_1.0.3_x86_64.fpk.sha256`；macOS 使用 `shasum -a 256 -c PTFlow_1.0.3_x86_64.fpk.sha256`。ARM 请替换文件名。SHA-256 检查下载损坏，不代替对发布者的信任。
+2. 可选但推荐：在下载目录校验完整性。Linux 使用 `sha256sum -c PTFlow_1.0.4_x86_64.fpk.sha256`；macOS 使用 `shasum -a 256 -c PTFlow_1.0.4_x86_64.fpk.sha256`。ARM 请替换文件名。SHA-256 检查下载损坏，不代替对发布者的信任。
 3. 打开 **飞牛 → 应用中心 → 手动安装**，选择 `.fpk` 并完成安装。
 4. 从飞牛桌面打开 **PTFlow**，入口为 `/app/ptflow-fnos/`，无需另开 NAS TCP 端口。
 5. 首次初始化必须从 **飞牛管理员桌面**打开，设置一个 **至少 10 字符**的独立管理密码；该密码不是下载器密码。飞牛网关确认管理员身份后允许初始化，此后仍需 PTFlow 自己的密码登录。随后完成下方连接设置。
 
 升级时在应用中心直接手动安装新版同架构 FPK；生命周期先停止旧进程，应用数据保留并继续使用。没有应用内自动更新器，不会自行拉取或替换安装包。
+
+若应用中心提示“安装包不符合系统要求”，先核对 NAS 的实际系统版本与 CPU 架构，再校验下载摘要并使用最新同架构包。`1.1.3100` 是本应用统一网关的最低版本声明，不应为绕过安装检查随意删除或降低；旧系统不支持该入口时，修复归档结构也不会补上网关能力。反馈时请提供系统页面显示的完整版本号、CPU 架构、安装包文件名和应用中心错误详情。
 
 > 本仓库包含真实服务/模拟 HTTP 联调与包结构检查入口；**不能把这些检查等同于真机安装测试**。没有可用 NAS 时，不能声明已在真实 fnOS 上验证安装。具体已运行检查、GitHub 构建成功与否，以对应提交的 Actions 和交付记录为准。
 
@@ -161,7 +163,7 @@ python3 scripts/audit-fpk.py dist/*.fpk
 
 构建脚本要求宿主 Python 3.12+ 和网络；从 Astral 官方 [python-build-standalone 固定发布 20261026](https://github.com/astral-sh/python-build-standalone/releases/tag/20261026) 下载 `install_only_stripped` CPython 3.12.16，**按官方发布资产的 SHA-256 校验后才解包执行**；地址、完整哈希及发布摘要来源记录于 [`scripts/runtime.lock.json`](scripts/runtime.lock.json)。NAS 启动时不下载任何运行时。所有应用依赖在构建时从带完整哈希的 `requirements.lock` 安装进该运行时；GPL、CPython、运行时组件与 wheel 自带许可文本随包交付。
 
-构建临时目录自动清理；缓存只在构建机 `.cache/runtime/`。图标由构建脚本用 Python 标准库原创绘制并编码为 64/256 PNG，**不引入 Pillow/前端构建依赖，不从其他应用复制图标**。应用内容作为 `app.tgz` 的根目录打包，清单 `checksum` 填其 MD5；外层按参考 FPK 格式 gzip tar，并生成 `.fpk.sha256`。MD5 仅为飞牛包格式字段，下载完整性使用外层 SHA-256。
+构建临时目录自动清理；缓存只在构建机 `.cache/runtime/`。图标由构建脚本用 Python 标准库原创绘制并编码为 64/256 PNG，**不引入 Pillow/前端构建依赖，不从其他应用复制图标**。内外两层均直接归档目录内的成员，不写入 `.` 根条目或 `./` 前缀：外层可直接查找 `manifest`、`app.tgz`，内层可直接查找 `ui/config`、`python/` 与 `server/`。这与官方 `fnpack 1.2.3` 实际输出及 [fnOS Apps 商店构建脚本](https://github.com/conversun/fnos-apps/blob/main/scripts/build-fpk.sh) 的根级成员布局一致；继续使用标准库，不引入打包器依赖。清单 `checksum` 填 `app.tgz` 的 MD5，外层生成 `.fpk.sha256`；MD5 仅为飞牛包格式字段，下载完整性使用外层 SHA-256。审计直接核对成员名，不再替旧格式剥离前缀。
 
 GitHub Actions 在推送 `main`、推送 `v*` 标签或手动触发时，分别使用 `ubuntu-24.04`（x86_64）与 `ubuntu-24.04-arm`（原生 ARM64）执行 unittest、构建和产物审计，再实际启动包内普通用户服务，检查 Unix 网关、认证、socket 权限、停止/重启与配置保留。`main` / 手动构建产物在 Actions Artifacts；匹配包版本的 `v*` 标签两架构都成功后，将 `.fpk` 和 `.sha256` 上传 Releases。发布需要仓库允许 workflow 的 `contents: write` 权限；不需要 Docker Hub 或运行时安装凭据。原生生命周期联调入口为 `scripts/smoke-fpk.py`，仅在隔离 Linux 构建机上以 root 执行，不代替飞牛真机安装验证。
 

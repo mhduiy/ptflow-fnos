@@ -13,7 +13,7 @@ def audit(path: Path):
     assert name == path.name, "SHA-256 filename mismatch"
     assert hashlib.sha256(path.read_bytes()).hexdigest() == expected, "Outer SHA-256 mismatch"
     with tarfile.open(path, "r:gz") as package:
-        files = {member.name.removeprefix("./"): member for member in package.getmembers()}
+        files = {member.name: member for member in package.getmembers()}
         for name in ("app.tgz", "manifest", "ICON.PNG", "ICON_256.PNG", "cmd/main",
                      "config/privilege", "config/resource", "wizard/uninstall"):
             assert name in files, f"Missing outer member {name}"
@@ -31,7 +31,7 @@ def audit(path: Path):
             assert struct.unpack("!II", image[16:24]) == (size, size)
         assert files["cmd/main"].mode & 0o111, "Lifecycle entry is not executable"
     with tarfile.open(fileobj=io.BytesIO(payload), mode="r:gz") as app:
-        files = {member.name.removeprefix("./"): member for member in app.getmembers()}
+        files = {member.name: member for member in app.getmembers()}
         for name in ("python/bin/python3.12", "server/ptflow/__main__.py", "server/ptflow/web.py",
                      "server/ptflow/static/index.html", "server/ptflow/static/app.css",
                      "server/ptflow/static/app.js", "ui/config", "lifecycle.py", "licenses/LICENSE",
