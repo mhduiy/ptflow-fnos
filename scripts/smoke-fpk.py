@@ -92,13 +92,13 @@ def check_package(package):
                     connection.sock.settimeout(10)
                     connection.sock.connect(str(data / "ptflow.sock"))
                     headers = {"Host": "internal.invalid", "X-Forwarded-Host": "nas.local",
-                               "X-Forwarded-Proto": "https"}
+                               "X-Forwarded-Proto": "https", "X-Forwarded-Port": "5667"}
                     if administrator is not None:
                         headers["X-Trim-Isadmin"] = "true" if administrator else "false"
                     if cookie:
                         headers["Cookie"] = cookie
                     if body is not None:
-                        headers.update({"Content-Type": "application/json", "Origin": "https://nas.local",
+                        headers.update({"Content-Type": "application/json", "Origin": "https://nas.local:5667",
                                         "X-CSRF-Token": csrf})
                     connection.request(method, path, body=json.dumps(body) if body is not None else None, headers=headers)
                     response = connection.getresponse()

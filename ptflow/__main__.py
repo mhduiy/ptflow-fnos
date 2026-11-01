@@ -20,7 +20,7 @@ def main():
     socket_path = os.environ.get("SOCKET_PATH", "")
     options = {"unix_socket": socket_path, "unix_socket_perms": "660"} if socket_path else {"host": arguments.host, "port": arguments.port}
     if socket_path:
-        options.update(trusted_proxy="localhost", trusted_proxy_headers={"x-forwarded-proto", "x-forwarded-host"})
+        options.update(trusted_proxy="localhost", trusted_proxy_headers={"x-forwarded-proto", "x-forwarded-host", "x-forwarded-port"})
     server = create_server(app, threads=8, max_request_body_size=65536, **options)
     store = app.extensions["ptflow_store"]
 

@@ -11,7 +11,6 @@ import time
 from flask import Flask, jsonify, request, send_file, send_from_directory, session
 from flask.sessions import SecureCookieSessionInterface
 from werkzeug.exceptions import HTTPException
-from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import check_password_hash, generate_password_hash
 
 from . import __version__
@@ -55,7 +54,7 @@ def create_app(data_dir, gateway_prefix="", start_scheduler=True):
                       SESSION_COOKIE_PATH=gateway_prefix.rstrip("/") + "/" if gateway_prefix else "/")
     app.session_interface = TransportSession()
     if gateway_prefix:
-        app.wsgi_app = GatewayPrefix(ProxyFix(app.wsgi_app, x_proto=1, x_host=1), gateway_prefix)
+        app.wsgi_app = GatewayPrefix(app.wsgi_app, gateway_prefix)
     app.extensions.update(ptflow_config=config, ptflow_store=store, ptflow_scheduler=scheduler)
     attempts, attempt_lock = defaultdict(deque), RLock()
 
@@ -74,7 +73,7 @@ def create_app(data_dir, gateway_prefix="", start_scheduler=True):
         if request.method not in ("GET", "HEAD", "OPTIONS"):
             origin = request.headers.get("Origin", "")
             parsed = urlsplit(origin)
-            if parsed.scheme not in ("http", "https") or parsed.netloc.lower() != request.host.lower():
+            if parsed.scheme != request.scheme or parsed.netloc.lower() != request.host.lower():
                 return jsonify(error="请求来源不匹配，请从 PTFlow 页面操作"), 403
             supplied = request.headers.get("X-CSRF-Token", "")
             if not supplied or not supplied.isascii() or not hmac.compare_digest(supplied, session.get("csrf_token", "")):

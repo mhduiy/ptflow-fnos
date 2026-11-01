@@ -185,15 +185,21 @@ class WebBehaviorTests(TestCase):
                     self.assertEqual(resource.status_code, 200)
             self.assertEqual(client.get("/api/auth").status_code, 200)
             client = app.test_client()
-            response = client.get("/app/ptflow-fnos/api/auth", headers=forwarded)
+            base_url = "https://nas.example:5667"
+            response = client.get("/app/ptflow-fnos/api/auth", headers=forwarded, base_url=base_url)
             self.assertIn("Secure", response.headers["Set-Cookie"])
             self.assertIn("Path=/app/ptflow-fnos/", response.headers["Set-Cookie"])
-            headers = {**forwarded, "Origin": "https://nas.example", "X-CSRF-Token": response.json["csrf_token"]}
-            self.assertEqual(client.post("/app/ptflow-fnos/api/setup", json={"password": "native-long-password"}, headers=headers).status_code, 403)
+            headers = {**forwarded, "Origin": base_url, "X-CSRF-Token": response.json["csrf_token"]}
+            for origin in ("https://nas.example", "https://nas.example:5668", "http://nas.example:5667", "https://other.example:5667", "null"):
+                with self.subTest(origin=origin):
+                    rejected = client.post("/app/ptflow-fnos/api/setup", json={}, base_url=base_url,
+                                           headers={**headers, "Origin": origin, "X-Trim-Isadmin": "true"})
+                    self.assertEqual(rejected.status_code, 403)
+            self.assertEqual(client.post("/app/ptflow-fnos/api/setup", json={"password": "gateway-admin-test-credential"}, headers=headers, base_url=base_url).status_code, 403)
             with redirect_stdout(StringIO()):
-                response = client.post("/app/ptflow-fnos/api/setup", json={"password": "native-long-password"}, headers={**headers, "X-Trim-Isadmin": "true"})
+                response = client.post("/app/ptflow-fnos/api/setup", json={"password": "gateway-admin-test-credential"}, headers={**headers, "X-Trim-Isadmin": "true"}, base_url=base_url)
             self.assertEqual(response.status_code, 200)
-            self.assertEqual(client.get("/app/ptflow-fnos/api/status", headers=forwarded).status_code, 200)
+            self.assertEqual(client.get("/app/ptflow-fnos/api/status", headers=forwarded, base_url=base_url).status_code, 200)
 
 
 if __name__ == "__main__":

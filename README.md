@@ -11,8 +11,8 @@
 | 项目 | 说明 |
 | --- | --- |
 | 飞牛系统 | fnOS **1.1.3100 或更新版本**，使用原生应用统一网关 |
-| Intel / AMD NAS | `PTFlow_1.0.5_x86_64.fpk`，基线 x86_64，不要求 AVX |
-| ARM NAS | `PTFlow_1.0.5_arm64.fpk`，aarch64 / arm64 |
+| Intel / AMD NAS | `PTFlow_1.0.6_x86_64.fpk`，基线 x86_64，不要求 AVX |
+| ARM NAS | `PTFlow_1.0.6_arm64.fpk`，aarch64 / arm64 |
 | 站点 | M-Team API；默认 `https://api.m-team.cc` |
 | 下载器 | qBittorrent Web API；用户名/密码认证，或支持 API Key 的版本（通常为 5.2.0+） |
 | 种子格式 | BEP 3 / v1；包含 v1 infohash 的混合种子可用，纯 BitTorrent v2 明确拒绝 |
@@ -23,7 +23,7 @@
 ## 安装与升级
 
 1. 在 Releases 下载适合 CPU 的 `.fpk` 及同名 `.fpk.sha256`。
-2. 可选但推荐：在下载目录校验完整性。Linux 使用 `sha256sum -c PTFlow_1.0.5_x86_64.fpk.sha256`；macOS 使用 `shasum -a 256 -c PTFlow_1.0.5_x86_64.fpk.sha256`。ARM 请替换文件名。SHA-256 检查下载损坏，不代替对发布者的信任。
+2. 可选但推荐：在下载目录校验完整性。Linux 使用 `sha256sum -c PTFlow_1.0.6_x86_64.fpk.sha256`；macOS 使用 `shasum -a 256 -c PTFlow_1.0.6_x86_64.fpk.sha256`。ARM 请替换文件名。SHA-256 检查下载损坏，不代替对发布者的信任。
 3. 打开 **飞牛 → 应用中心 → 手动安装**，选择 `.fpk` 并完成安装。
 4. 从飞牛桌面打开 **PTFlow**，入口为 `/app/ptflow-fnos/`，无需另开 NAS TCP 端口。
 5. 首次初始化必须从 **飞牛管理员桌面**打开，设置一个 **至少 10 字符**的独立管理密码；该密码不是下载器密码。飞牛网关确认管理员身份后允许初始化，此后仍需 PTFlow 自己的密码登录。随后完成下方连接设置。
@@ -33,6 +33,8 @@
 若应用中心提示“安装包不符合系统要求”，先核对 NAS 的实际系统版本与 CPU 架构，再校验下载摘要并使用最新同架构包。`1.1.3100` 是本应用统一网关的最低版本声明，不应为绕过安装检查随意删除或降低；旧系统不支持该入口时，修复归档结构也不会补上网关能力。反馈时请提供系统页面显示的完整版本号、CPU 架构、安装包文件名和应用中心错误详情。
 
 系统版本与架构符合但仍被拒绝时，读取失败时刻前后的系统日志：`sudo journalctl -b --since "-10 min" -o short-precise --no-pager`。`APP_INSTALL_FAILED_PKG_EXCEPTION` 表示包处理异常，不应仅凭这条事件断定系统太旧；保留周边解析/解包错误，分享前遮掉凭据。`1.0.4` 及更早包缺少部分官方必需的生命周期文件，`1.0.5` 补齐并把九个入口纳入产物审计。
+
+从 PTFlow 页面创建密码却提示“请求来源不匹配”时，升级到 `1.0.6` 或更新版本。旧版本丢掉了统一网关转发的非默认端口，导致浏览器来源与后端主机不一致；无需改密码、清空数据或关闭来源/CSRF 校验。
 
 > 本仓库包含真实服务/模拟 HTTP 联调与包结构检查入口；**不能把这些检查等同于真机安装测试**。没有可用 NAS 时，不能声明已在真实 fnOS 上验证安装。具体已运行检查、GitHub 构建成功与否，以对应提交的 Actions 和交付记录为准。
 
@@ -151,6 +153,8 @@ python -m ptflow --data-dir "$HOME/.local/share/ptflow-dev" --host 127.0.0.1 --p
 ```
 
 打开 `http://127.0.0.1:8787/`。这是回环开发入口，不是 NAS 公网部署方法。`SOCKET_PATH` 环境变量存在时优先使用 Unix socket；原生模式使用 `GATEWAY_PREFIX=/app/ptflow-fnos`，兼容飞牛保留或剥离前缀两种转发方式。
+
+代理头只由 Unix 入口的 Waitress 解析一次：仅信任本机网关的 `X-Forwarded-Proto`、`X-Forwarded-Host`、`X-Forwarded-Port`，保留外部非默认端口；应用层不再重复覆盖主机。来源校验同时检查协议和主机/端口，并继续要求会话 CSRF 令牌；TCP 入口不信任转发头。
 
 FPK **必须在与目标架构相同的原生 Linux 机器上**构建；不在 macOS 上运行 Linux Python，也不通过 Docker、QEMU 或交叉执行来伪装 native 构建：
 
