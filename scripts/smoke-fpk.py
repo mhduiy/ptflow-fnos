@@ -118,6 +118,16 @@ def check_package(package):
                 return status, json.loads(raw)
 
             def run(kind):
+                deadline = time.monotonic() + 30
+                while time.monotonic() < deadline:
+                    status, state = api("status")
+                    assert status == 200, state
+                    collect = next(item for item in state["schedules"] if item["kind"] == "collect")
+                    if state["current_run"] is None and state["sample"] and collect["next_at"] > state["now"]:
+                        break
+                    time.sleep(0.1)
+                else:
+                    raise AssertionError(f"Initial sampling did not finish: {state}")
                 status, result = api("run", "POST", {"kind": kind})
                 assert status == 202, result
                 deadline = time.monotonic() + 30

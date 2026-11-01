@@ -11,8 +11,8 @@
 | 项目 | 说明 |
 | --- | --- |
 | 飞牛系统 | fnOS **1.1.3100 或更新版本**，使用原生应用统一网关 |
-| Intel / AMD NAS | `PTFlow_1.0.2_x86_64.fpk`，基线 x86_64，不要求 AVX |
-| ARM NAS | `PTFlow_1.0.2_arm64.fpk`，aarch64 / arm64 |
+| Intel / AMD NAS | `PTFlow_1.0.3_x86_64.fpk`，基线 x86_64，不要求 AVX |
+| ARM NAS | `PTFlow_1.0.3_arm64.fpk`，aarch64 / arm64 |
 | 站点 | M-Team API；默认 `https://api.m-team.cc` |
 | 下载器 | qBittorrent Web API；用户名/密码认证，或支持 API Key 的版本（通常为 5.2.0+） |
 | 种子格式 | BEP 3 / v1；包含 v1 infohash 的混合种子可用，纯 BitTorrent v2 明确拒绝 |
@@ -23,7 +23,7 @@
 ## 安装与升级
 
 1. 在 Releases 下载适合 CPU 的 `.fpk` 及同名 `.fpk.sha256`。
-2. 可选但推荐：在下载目录校验完整性。Linux 使用 `sha256sum -c PTFlow_1.0.2_x86_64.fpk.sha256`；macOS 使用 `shasum -a 256 -c PTFlow_1.0.2_x86_64.fpk.sha256`。ARM 请替换文件名。SHA-256 检查下载损坏，不代替对发布者的信任。
+2. 可选但推荐：在下载目录校验完整性。Linux 使用 `sha256sum -c PTFlow_1.0.3_x86_64.fpk.sha256`；macOS 使用 `shasum -a 256 -c PTFlow_1.0.3_x86_64.fpk.sha256`。ARM 请替换文件名。SHA-256 检查下载损坏，不代替对发布者的信任。
 3. 打开 **飞牛 → 应用中心 → 手动安装**，选择 `.fpk` 并完成安装。
 4. 从飞牛桌面打开 **PTFlow**，入口为 `/app/ptflow-fnos/`，无需另开 NAS TCP 端口。
 5. 首次初始化必须从 **飞牛管理员桌面**打开，设置一个 **至少 10 字符**的独立管理密码；该密码不是下载器密码。飞牛网关确认管理员身份后允许初始化，此后仍需 PTFlow 自己的密码登录。随后完成下方连接设置。
