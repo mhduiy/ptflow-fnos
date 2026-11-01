@@ -5,6 +5,7 @@ from threading import Event, RLock, Thread
 import time
 import uuid
 
+from . import __version__
 from .config import is_work_time
 from .engine import Engine
 
@@ -139,7 +140,7 @@ class Scheduler:
         with self.lock:
             current = deepcopy(self.current)
             schedules = [{"kind": key, "label": LABELS[key], "interval_seconds": duration, "next_at": iso(self.deadlines[key]) if (key == "collect" and config["downloader"]["url"] or enabled and config["downloader"]["url"]) else None} for key, duration in self.intervals(config).items()]
-        return {"version": "1.0.0", "configured": bool(config["downloader"]["url"] and config["mteam"]["api_key"]),
+        return {"version": __version__, "configured": bool(config["downloader"]["url"] and config["mteam"]["api_key"]),
                 "enabled": enabled, "working_time": is_work_time(config), "now": iso(time.time()),
                 "current_run": current, "last_run": runs[0] if runs else None, "schedules": schedules,
                 "sample": sample, "sample_age_seconds": max(0, time.time() - sample["time"]) if sample else None,

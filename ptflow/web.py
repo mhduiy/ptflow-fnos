@@ -14,6 +14,7 @@ from werkzeug.exceptions import HTTPException
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import check_password_hash, generate_password_hash
 
+from . import __version__
 from .config import Config, validate_config
 from .engine import Engine
 from .scheduler import Scheduler
@@ -131,7 +132,7 @@ def create_app(data_dir, gateway_prefix="", start_scheduler=True):
 
     @app.get("/health")
     def health():
-        return jsonify(ok=True, version="1.0.0")
+        return jsonify(ok=True, version=__version__)
 
     @app.get("/")
     def index():

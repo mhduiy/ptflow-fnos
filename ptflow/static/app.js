@@ -203,6 +203,7 @@
       state.dirty = false;
       updateDirty();
     }
+    syncTorrentBudget();
     updateSecretHints();
     $('settings-fields').disabled = false;
     $('save-config').disabled = false;
@@ -218,6 +219,14 @@
     $('qb-username').closest('.field').hidden = keyAuth;
     $('qb-password').closest('.field').hidden = keyAuth;
     $('qb-api-key').closest('.field').hidden = !keyAuth;
+  }
+  function syncTorrentBudget() {
+    const input = $('max-torrent');
+    const valid = input.value !== '' && input.checkValidity();
+    const label = valid ? `${number(input.value,20)} GiB` : '请输入 0.01–100,000 GiB 的有效预算';
+    if (valid) $('max-torrent-range').value = Math.log10(Number(input.value));
+    $('max-torrent-range').setAttribute('aria-valuetext',label);
+    $('max-torrent-value').textContent = label;
   }
   function readDraft() {
     const config = {downloader:{},mteam:{modes:[]},schedule:{},strategy:{}};
@@ -235,6 +244,8 @@
     $('savebar-label').textContent = state.dirty ? '有未保存的更改' : '更改只在保存后生效';
   }
   $('settings-form').addEventListener('input',event => {
+    if (event.target.id === 'max-torrent-range') $('max-torrent').value = Number((10 ** Number(event.target.value)).toPrecision(6));
+    if (['max-torrent','max-torrent-range'].includes(event.target.id)) syncTorrentBudget();
     state.revision++; state.dirty = true; updateDirty();
     const target = event.target.name?.split('.')[0];
     if (['downloader','mteam'].includes(target)) showMessage('test-'+target,'');

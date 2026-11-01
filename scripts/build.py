@@ -142,7 +142,7 @@ def build(arch: str, output: Path) -> Path:
             shutil.copy2(cached, python_licenses / name)
         shutil.copy2(ROOT / "scripts/runtime.lock.json", licenses / "runtime.lock.json")
         (licenses / "THIRD_PARTY_NOTICES.txt").write_text(
-            "PTFlow 1.0.0: GPL-3.0-only; source https://github.com/mhduiy/ptflow-fnos\n"
+            f"PTFlow {version}: GPL-3.0-only; source https://github.com/mhduiy/ptflow-fnos\n"
             "Behavior reference: PTBrush https://github.com/mhduiy/ptbrush\n"
             "fnOS integration reference: Clash-for-fnos (GPL-3.0)\n"
             "https://github.com/chenpingonline/Clash-for-fnos\n"
