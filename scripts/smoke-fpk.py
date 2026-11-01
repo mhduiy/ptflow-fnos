@@ -228,13 +228,13 @@ finally:
                                  "min_torrent_gib": 0, "max_torrent_gib": 12 / 1024}})
                 assert status == 200 and configuration["schedule"]["query_minutes"] == 77
                 # A 32MiB package cannot enter the candidate list under a 12MiB total cap.
-                assert run("query")["counts"]["persisted"] == 0
+                assert run("query")["counts"]["query"]["persisted"] == 0
                 run("brush", "skipped")
                 assert api("candidates")[1]["items"] == [] and simulator.adds == []
                 status, configuration = api("config", "PUT", {
                     "strategy": {"min_torrent_gib": 32 / 1024, "max_torrent_gib": 32 / 1024}})
                 assert status == 200
-                assert run("query")["counts"]["persisted"] == 2
+                assert run("query")["counts"]["query"]["persisted"] == 2
                 # Even though individual files fit, disk headroom must fit the entire package.
                 simulator.server_state["free_space_on_disk"] = 1024**3 + 20 * 1024**2
                 run("brush", "skipped")
