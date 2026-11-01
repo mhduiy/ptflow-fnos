@@ -3,6 +3,7 @@
 from datetime import datetime
 import math
 import time
+from threading import Event, Thread
 from zoneinfo import ZoneInfo
 
 from .integrations import IntegrationError, MTeam, QBittorrent, select_files, torrent_metadata
@@ -63,7 +64,9 @@ def owned(rows, candidates):
     confirmed = {str(c["qb_hash"]).lower(): c for c in candidates
                  if c.get("state") == "submitted" and c.get("qb_hash")}
     return [(row, confirmed[str(row["hash"]).lower()]) for row in rows
-            if row.get("category") == "ptflow" and str(row["hash"]).lower() in confirmed]
+            if row.get("category") == "ptflow" and str(row["hash"]).lower() in confirmed
+            and f"ptflow-id-{confirmed[str(row['hash']).lower()]['id']}" in
+            {tag.strip() for tag in str(row.get("tags", "")).split(",")}]
 
 
 def matching(rows, expected, identity):
@@ -100,11 +103,29 @@ class Engine:
         self._event("INFO", "query", "串行查询 Free 候选；入库不等于提交下载器")
         mt = self._mt()
         settings = self.config["mteam"]
-        counts = {"returned": 0, "persisted": 0, "skipped": 0, "failed": 0}
+        counts = {"returned": 0, "persisted": 0, "skipped": 0, "failed": 0, "protection_failed": 0}
+        stopped, protector = Event(), None
+        run_id = getattr(self.store.context, "run_id", "")
+
+        def protect():
+            # Only queries overlap maintenance; QB add/delete jobs remain single-flight.
+            engine = Engine(self.config, self.store, lambda stage, message: None)
+            with self.store.run_context(run_id):
+                while not stopped.wait(self.config["schedule"]["stats_seconds"]):
+                    try:
+                        outcome = engine.collect()
+                        counts["protection_failed"] += outcome["counts"]["failed"]
+                    except IntegrationError as error:
+                        counts["protection_failed"] += 1
+                        engine._event("ERROR", "free.protect", str(error))
+
         try:
             modes = settings["modes"]
             if not modes:
                 return result("skipped", "没有启用查询分类", **counts)
+            if self.config["downloader"]["url"] and self.store.summary()["submitted"]:
+                protector = Thread(target=protect, name="ptflow-query-protection", daemon=True)
+                protector.start()
             for index, mode in enumerate(modes):
                 if index:
                     delay = settings["request_interval_seconds"]
@@ -134,11 +155,19 @@ class Engine:
                         "seeders": row["seeders"], "leechers": row["leechers"],
                         "score": row["score"], "free_until": row["free_until"], "mode": mode,
                     })
-            status = "partial" if counts["failed"] and counts["persisted"] else "failed" if counts["failed"] else "succeeded"
+            stopped.set()
+            if protector is not None:
+                protector.join()
+            status = "partial" if counts["protection_failed"] else "partial" if counts["failed"] and counts["persisted"] else "failed" if counts["failed"] else "succeeded"
             message = f"查询完成：入库/更新 {counts['persisted']} 项，跳过 {counts['skipped']} 项，失败分类 {counts['failed']}；未提交 QB"
+            if counts["protection_failed"]:
+                message += f"；Free 保护检查失败 {counts['protection_failed']} 次，请检查下载器状态"
             self._event("INFO", "query", message, counts)
             return result(status, message, **counts)
         finally:
+            stopped.set()
+            if protector is not None:
+                protector.join()
             mt.close()
 
     def _observe(self, rows):
@@ -162,16 +191,23 @@ class Engine:
         count, failed = 0, 0
         horizon = time.time() + self.strategy["min_free_hours"] * 3600
         for row, record in owned(rows, self.store.candidates(limit=100000)):
-            if record["free_until"] > horizon:
+            if record["free_until"] > horizon or (row.get("progress", 0) >= 1 and row.get("dlspeed", 0) <= 0):
                 continue
             torrent_hash = row["hash"]
             try:
+                # Stop before reading files: a failed read must not leave a download running.
+                running = row.get("state") not in STOPPED or row.get("dlspeed", 0) > 0
+                if running:
+                    qb.stop(torrent_hash)
+                    stopped_row = matching(qb.torrents(), torrent_hash, record["id"])
+                    if not stopped_row or stopped_row.get("state") not in STOPPED or stopped_row.get("dlspeed", 0) > 0:
+                        raise IntegrationError("临期下载停止状态未确认，禁止新增")
                 files = qb.files(torrent_hash)
                 incomplete = [f["index"] for f in files if f.get("progress", 0) < 1 and f["priority"] != 0]
                 if not incomplete:
+                    if running:
+                        qb.start(torrent_hash)
                     continue
-                # Stop first; then forbid every unfinished file, preserving completed files/data.
-                qb.stop(torrent_hash)
                 qb.priority(torrent_hash, incomplete, 0)
                 after = qb.files(torrent_hash)
                 if any(f.get("progress", 0) < 1 and f["priority"] != 0 for f in after):
@@ -185,7 +221,7 @@ class Engine:
                 count += 1
             except IntegrationError as error:
                 failed += 1
-                self._reason(record["id"], str(error))
+                self._reason(record["id"], str(error) + "；Free 保护未确认，禁止新增；请核实 QB 停止状态")
         return count, failed
 
     def collect(self):
@@ -273,17 +309,14 @@ class Engine:
 
     def _gate(self, sample, rows):
         settings = self.strategy
-        history = self.store.history(minutes=settings["speed_window_minutes"])
+        history = self.store.speed_window(minutes=settings["speed_window_minutes"])
         fresh_age = max(60, self.config["schedule"]["stats_seconds"] * 2)
         now = time.time()
-        history = [s for s in history if now - settings["speed_window_minutes"] * 60 <= s["time"] <= now]
-        latest = self.store.latest_sample()
-        if not latest or not history or now - latest["time"] > fresh_age:
+        if not history["samples"] or now - history["time"] > fresh_age:
             return "缺少新鲜下载器采样，不新增", 0, 0
         reserve = int(settings["min_free_gib"] * GIB)
         budget = max(0, sample["free_space"] - reserve)
-        peak = max(s["dlspeed"] for s in history)
-        average = sum(s["upspeed"] for s in history) / len(history)
+        peak, average = history["peak_download"], history["average_upload"]
         # Count global incomplete running/queued tasks, including seeds outside our ownership.
         downloading = sum(1 for row in rows if row.get("progress", 0) < 1 and row.get("state") not in STOPPED)
         slots = max(0, settings["max_downloading"] - downloading)
@@ -291,8 +324,8 @@ class Engine:
             "free_space": sample["free_space"], "reserve": reserve, "budget": budget,
             "peak_download": peak, "download_limit": settings["max_download_mib"] * MIB,
             "average_upload": average, "upload_target": settings["target_upload_mib"] * MIB,
-            "window_minutes": settings["speed_window_minutes"], "samples": len(history),
-            "sample_age_seconds": now - latest["time"], "downloading": downloading, "slots": slots,
+            "window_minutes": settings["speed_window_minutes"], "samples": history["samples"],
+            "sample_age_seconds": now - history["time"], "downloading": downloading, "slots": slots,
         })
         if not budget:
             return "磁盘剩余不足保留阈值，不新增", slots, budget
@@ -313,7 +346,11 @@ class Engine:
             sample = self._sample(qb)
             rows = qb.torrents()
             self._observe(rows)
-            self._expire(qb, rows)
+            _, counts["failed"] = self._expire(qb, rows)
+            if counts["failed"]:
+                message = "Free 保护未确认：已请求停止临期下载，本轮禁止新增；检查保护错误日志"
+                self._event("ERROR", "free.protect", message, counts)
+                return result("failed", message, **counts)
             recovered = []
             for record in self.store.candidates(limit=100000):
                 if record["state"] != "uncertain":
@@ -348,7 +385,10 @@ class Engine:
                 if not slots:
                     break
                 if record["free_until"] <= time.time() + self.strategy["min_free_hours"] * 3600:
-                    self._expire(qb, [row])
+                    _, failed = self._expire(qb, [row])
+                    counts["failed"] += failed
+                    if failed:
+                        return result("partial" if counts["reconciled"] else "failed", "Free 保护未确认，本轮禁止新增", **counts)
                     continue
                 try:
                     size = self._prepare(qb, row, record, min(max_budget, disk_budget))

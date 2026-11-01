@@ -4,9 +4,10 @@
   const apiBase = new URL('./api/', location.href.split('#')[0]);
   const pages = {overview:'总览',torrents:'托管种子',candidates:'候选池',logs:'运行日志',settings:'设置'};
   const kinds = {full:'完整运行',query:'查询候选',brush:'执行刷流',cleanup:'清理检查',collect:'统计采样'};
+  const settingsAnchors = ['connections','schedule-settings','strategy-settings','security-settings','qb-url','qb-username','qb-password','qb-api-key','mt-api-key'];
   const statuses = {succeeded:'成功',partial:'部分完成',skipped:'已跳过',failed:'失败',pending:'待处理',submitted:'已确认',uncertain:'待核实',removed:'已移除',running:'运行中'};
   const knownStages = new Set([...$('log-stages').options].map(option => option.value));
-  const state = {csrf:'',authenticated:false,setup:false,page:'overview',config:null,secretFields:[],dirty:false,revision:0,status:null,clockOffset:0,torrents:[],candidates:[],runs:[],history:[],cursor:0,logGeneration:0,logLoading:false,logPaused:false,logCount:0,polling:false,timer:null,lastData:0,authLoading:false,toastTimer:null,busyRun:false};
+  const state = {csrf:'',authenticated:false,setup:false,page:'overview',config:null,secretFields:[],dirty:false,revision:0,status:null,clockOffset:0,torrents:[],candidates:[],runs:[],history:[],cursor:0,logGeneration:0,logLoading:false,logPaused:false,logCount:0,polling:false,timer:null,lastData:0,authLoading:false,toastTimer:null,busyRun:false,manualRun:null};
   const escape = value => String(value ?? '').replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
   const now = () => Date.now() + state.clockOffset;
   const epoch = value => typeof value === 'number' ? value * 1000 : Date.parse(value);
@@ -145,6 +146,8 @@
     state.torrents = [];
     state.candidates = [];
     state.runs = [];
+    state.manualRun = null;
+    $('run-feedback').hidden = true;
     state.history = [];
     state.dirty = false;
     state.lastData = 0;
@@ -161,7 +164,7 @@
   }
   function navigate(fetchData=true) {
     const hash = location.hash.slice(1);
-    const settingsAnchor = ['connections','schedule-settings','strategy-settings','security-settings'].includes(hash);
+    const settingsAnchor = settingsAnchors.includes(hash);
     const page = settingsAnchor ? 'settings' : Object.hasOwn(pages,hash) ? hash : 'overview';
     const changed = page !== state.page;
     state.page = page;
@@ -173,7 +176,7 @@
     $('page-label').textContent = pages[page];
     document.title = `${pages[page]} · PTFlow`;
     if (changed && !settingsAnchor) window.scrollTo({top:0,behavior:'instant'});
-    if (settingsAnchor) requestAnimationFrame(() => $(hash).scrollIntoView({block:'start'}));
+    if (settingsAnchor) requestAnimationFrame(() => { $(hash).scrollIntoView({block:'center'}); if ($(hash).matches('input')) $(hash).focus({preventScroll:true}); });
     if (fetchData && state.authenticated && changed) loadPageData();
   }
   window.addEventListener('hashchange',() => navigate());
@@ -231,7 +234,11 @@
     $('save-state').textContent = state.dirty ? '有未保存的更改' : '配置已保存';
     $('savebar-label').textContent = state.dirty ? '有未保存的更改' : '更改只在保存后生效';
   }
-  $('settings-form').addEventListener('input',() => { state.revision++; state.dirty = true; updateDirty(); });
+  $('settings-form').addEventListener('input',event => {
+    state.revision++; state.dirty = true; updateDirty();
+    const target = event.target.name?.split('.')[0];
+    if (['downloader','mteam'].includes(target)) showMessage('test-'+target,'');
+  });
   $('settings-form').addEventListener('change',updateSecretHints);
   window.addEventListener('beforeunload',event => { if (state.dirty) { event.preventDefault(); event.returnValue = ''; } });
   $('settings-form').addEventListener('submit',async event => {
@@ -262,11 +269,14 @@
     output.classList.remove('failed');
     output.textContent = '正在使用当前表单内容测试；不会保存更改。';
     try {
-      const result = await request('test',{method:'POST',body:{target,config:readDraft()}});
-      output.classList.toggle('failed',!result.ok);
-      output.textContent = `${result.ok ? '连接成功' : '连接失败'} · ${result.message || '服务未返回说明'}（使用未保存表单）`;
+      const draft = readDraft();
+      const tested = JSON.stringify(draft[target]);
+      const result = await request('test',{method:'POST',body:{target,config:draft}});
+      const changed = tested !== JSON.stringify(readDraft()[target]);
+      output.classList.toggle('failed',!result.ok || changed);
+      output.textContent = changed ? '测试期间连接内容已更改，请重新测试当前表单。' : `${result.ok ? '连接成功' : '连接失败'} · ${result.message || '服务未返回说明'}（使用测试开始时的表单；不会保存）`;
     } catch (error) { output.classList.add('failed'); output.textContent = error.message; }
-    finally { button.disabled = false; button.textContent = text; }
+    finally { output.hidden = false; button.disabled = false; button.textContent = text; }
   }));
   $('automation-toggle').addEventListener('click',async () => {
     if (!state.config || !state.status) return;
@@ -303,6 +313,7 @@
       const status = await request('status');
       if (!state.authenticated) return;
       const finished = Boolean(state.status?.current_run && !status.current_run);
+      const changedRun = Boolean(status.last_run && status.last_run.id !== state.status?.last_run?.id);
       state.status = status;
       const serverTime = Date.parse(status.now);
       if (Number.isFinite(serverTime)) state.clockOffset = serverTime - Date.now();
@@ -310,20 +321,51 @@
       showMessage('global-error','');
       $('connection-state').innerHTML = '<span class="status-dot"></span>服务在线';
       $('connection-state').classList.remove('offline');
-      if (finished) { state.lastData = 0; loadRuns(); }
+      if (finished || changedRun) { state.lastData = 0; loadRuns(); }
     } catch (error) {
       $('connection-state').innerHTML = '<span class="status-dot"></span>连接中断';
       $('connection-state').classList.add('offline');
       showMessage('global-error',`${error.message} 已显示的数据为最后成功读取的快照，不代表当前状态。`);
     }
   }
+  function missingConfig() {
+    if (!state.config) return [];
+    const missing = [];
+    const downloader = state.config.downloader;
+    if (!downloader.url) missing.push(['qb-url','qBittorrent 服务地址']);
+    if (downloader.auth_type === 'api_key') {
+      if (!state.secretFields.includes('downloader.api_key')) missing.push(['qb-api-key','qBittorrent API Key']);
+    } else {
+      if (!downloader.username) missing.push(['qb-username','qBittorrent 用户名']);
+      if (!state.secretFields.includes('downloader.password')) missing.push(['qb-password','qBittorrent 密码']);
+    }
+    if (!state.secretFields.includes('mteam.api_key')) missing.push(['mt-api-key','M-Team API Key']);
+    return missing;
+  }
+  function renderRunFeedback() {
+    const tracked = state.manualRun;
+    const current = state.status?.current_run;
+    const run = tracked ? (current?.id === tracked.id ? current : state.runs.find(run => run.id === tracked.id) || (state.status?.last_run?.id === tracked.id ? state.status.last_run : tracked)) : current;
+    const output = $('run-feedback');
+    output.hidden = !run && !state.busyRun;
+    if (output.hidden) return;
+    const status = run?.status || (run ? 'running' : 'pending');
+    const finished = Boolean(run?.finished_at);
+    if (tracked && finished) state.manualRun = run;
+    output.classList.toggle('danger',status === 'failed');
+    output.classList.toggle('warning',['partial','skipped'].includes(status));
+    const markup = `<div class="run-feedback-copy"><strong>${run ? escape(kinds[run.kind] || run.kind)+' · '+escape(statuses[status] || status) : '正在提交任务…'}</strong><p>${escape(run?.message || '等待服务确认，请勿重复点击。')}</p>${run ? `<p>${escape(finished ? date(run.finished_at,true)+' 结束' : run.stage || '等待执行')} · 本次运行 ${escape(run.id)}</p>` : ''}</div>${run ? `<div class="run-feedback-links"><a class="text-link run-log-link" href="#logs" data-run-id="${escape(run.id)}">${finished ? '查看本次日志' : '跟踪本次日志'} →</a>${finished && ['full','query','brush'].includes(run.kind) ? `<a class="text-link" href="#candidates">候选结果 →</a>${run.kind !== 'query' ? '<a class="text-link" href="#torrents">托管种子 →</a>' : ''}` : ''}</div>` : ''}`;
+    if (output.innerHTML !== markup) output.innerHTML = markup;
+  }
   function renderStatus() {
     const status = state.status;
     if (!status) return;
     $('version-label').textContent = 'v'+status.version;
-    $('setup-notice').hidden = status.configured;
-    $('automation-title').textContent = status.enabled ? status.working_time ? '自动运行已启用，一切按计划进行。' : '自动运行已启用，当前在工作时段之外。' : '自动查询、添加与闲置清理已暂停。';
-    $('automation-description').textContent = status.current_run ? `${kinds[status.current_run.kind] || status.current_run.kind}进行中 · ${status.current_run.message || status.current_run.stage || '正在执行'}` : status.enabled ? '手动运行同样遵守磁盘、Free 与速度保护。' : '统计采样与 Free 安全保护继续运行；手动运行仍可使用。';
+    const missing = missingConfig();
+    $('setup-notice').hidden = state.config ? !missing.length : status.configured;
+    $('setup-missing').innerHTML = missing.map(([id,label]) => `<li><a href="#${id}">${escape(label)} →</a></li>`).join('');
+    $('automation-title').textContent = status.enabled ? missing.length || !status.configured ? '自动运行已启用，但连接配置尚未补齐。' : status.working_time ? '自动运行已启用，一切按计划进行。' : '自动运行已启用，当前在工作时段之外。' : '自动查询、添加与闲置清理已暂停。';
+    $('automation-description').textContent = status.current_run ? `${kinds[status.current_run.kind] || status.current_run.kind}进行中 · ${status.current_run.message || status.current_run.stage || '正在执行'}` : missing.length ? '请先补齐上方已保存配置并测试连接；启用开关不代表服务已连接。' : status.enabled ? status.working_time ? '等待下方计划时间；手动运行同样遵守磁盘、Free 与速度保护。' : '自动查询与添加会跳过当前时段；统计采样与安全维护仍按计划执行。' : '统计采样与 Free 安全保护继续运行；手动运行仍可使用。';
     $('automation-toggle').textContent = status.enabled ? '暂停自动运行' : '启用自动运行';
     $('automation-toggle').disabled = !state.config;
     metric('upload-speed',status.sample?.upspeed,true);
@@ -359,7 +401,7 @@
     document.querySelectorAll('[data-next]').forEach(element => {
       const next = element.dataset.next;
       const disabledCleanup = element.dataset.kind === 'cleanup' && state.config && !state.config.strategy.cleanup_enabled;
-      const label = disabledCleanup ? '仅 Free 保护' : next ? countdown(next) : state.status?.enabled || element.dataset.kind === 'collect' ? '等待调度' : '已暂停';
+      const label = state.config && !state.config.downloader.url ? '未配置下载器' : disabledCleanup ? '仅 Free 保护' : ['query','brush'].includes(element.dataset.kind) && state.status?.enabled && !state.status.working_time ? '工作时段外' : next ? countdown(next) : state.status?.enabled || element.dataset.kind === 'collect' ? '等待调度' : '已暂停';
       element.innerHTML = `${escape(label)}${next ? `<small title="${escape(date(next,true))}">${escape(date(next))}</small>` : ''}`;
     });
     if (state.status?.sample) {
@@ -367,22 +409,26 @@
       const stale = age > Math.max(90,(state.config?.schedule.stats_seconds || 30)*3);
       $('sample-note').classList.toggle('stale',stale);
       $('sample-note').textContent = `${stale ? '采样已过期 · ' : '最后真实采样 · '}${date(state.status.sample.time,true)} · ${age < 60 ? Math.floor(age)+' 秒前' : Math.floor(age/60)+' 分钟前'}。速度与累计传输均为下载器全局数据，不仅是 PTFlow。`;
-    } else { $('sample-note').classList.remove('stale'); $('sample-note').textContent = '尚无下载器采样；不会使用模拟数据。'; }
+    } else { $('sample-note').classList.remove('stale'); $('sample-note').textContent = state.config && !state.config.downloader.url ? '尚无下载器采样 · 请先保存 qBittorrent 连接配置。' : '等待第一次下载器采样 · 按下方采样计划自动读取；连接失败原因可在运行记录与日志中查看。'; }
   }
   setInterval(() => { if (state.authenticated && !document.hidden) updateCountdowns(); },1000);
   setInterval(() => { if (state.authenticated && state.page === 'logs' && !document.hidden && !state.logPaused) loadLogs(); },2000);
   function updateRunButtons() {
     const busy = state.busyRun || Boolean(state.status?.current_run);
     document.querySelectorAll('[data-run]').forEach(button => { button.disabled = busy; button.title = busy ? '已有任务运行中，请等待完成' : '手动运行仍遵守所有保护条件'; });
+    renderRunFeedback();
   }
   document.querySelectorAll('[data-run]').forEach(button => button.addEventListener('click',async () => {
     if (state.busyRun || state.status?.current_run) return;
     state.busyRun = true;
+    state.manualRun = null;
     updateRunButtons();
     try {
       const result = await request('run',{method:'POST',body:{kind:button.dataset.run}});
+      state.manualRun = {id:result.id,kind:button.dataset.run,status:'pending',message:result.message || '任务已接收，等待执行'};
+      renderRunFeedback();
       toast(result.message || '任务已启动，运行结果请查看日志。');
-      await loadStatus();
+      await Promise.all([loadStatus(),loadRuns()]);
       state.lastData = 0;
     } catch (error) { toast(error.message,true); if (error.status === 409) await loadStatus(); }
     finally { state.busyRun = false; updateRunButtons(); }
@@ -393,6 +439,7 @@
       if (!state.authenticated) return;
       state.runs = result.items || [];
       renderRuns();
+      renderRunFeedback();
       showMessage('runs-error','');
     } catch (error) { showMessage('runs-error',error.message); }
   }
@@ -499,6 +546,13 @@
   }
   $('candidate-search').addEventListener('input',renderCandidates);
   $('candidate-state').addEventListener('change',renderCandidates);
+  function updateLogContext(loading=false) {
+    const filters = [$('log-level').value,$('log-stage').value.trim(),$('log-search').value.trim()].filter(Boolean);
+    $('log-filter-notice').hidden = !filters.length;
+    $('log-filter-description').textContent = `仍按级别、阶段或搜索筛选：${filters.join(' · ')}。可能隐藏本次运行的其他记录。`;
+    $('log-empty-title').textContent = state.logPaused ? '日志更新已暂停' : loading ? '正在读取日志…' : filters.length || $('log-run').value ? '暂无匹配日志' : '尚无运行日志';
+    $('log-empty-description').textContent = state.logPaused ? '点击「继续」读取记录；当前运行与筛选条件会保留。' : loading ? '正在读取服务端真实记录，请稍候。' : filters.length ? '可以清除级别、阶段与搜索，保留当前运行筛选查看完整过程。' : '新记录每 2 秒自动读取；任务开始后可在这里查看过程。';
+  }
   function resetLogs(fetchData=true) {
     state.cursor = 0;
     state.logGeneration++;
@@ -508,21 +562,29 @@
     $('log-count').textContent = '0 条记录';
     showMessage('log-reset-notice','');
     showMessage('logs-error','');
+    updateLogContext(fetchData);
     if (fetchData && state.authenticated && !state.logPaused) loadLogs();
   }
   let logDebounce;
   for (const id of ['log-level','log-run']) $(id).addEventListener('change',() => resetLogs());
   for (const id of ['log-stage','log-search']) $(id).addEventListener('input',() => { clearTimeout(logDebounce); logDebounce = setTimeout(() => resetLogs(),350); });
+  $('log-clear-filters').addEventListener('click',() => {
+    clearTimeout(logDebounce);
+    for (const id of ['log-level','log-stage','log-search']) $(id).value = '';
+    resetLogs();
+  });
   $('log-pause').addEventListener('click',() => {
     state.logPaused = !state.logPaused;
     $('log-pause').textContent = state.logPaused ? '继续' : '暂停';
     $('log-live').innerHTML = `<span class="status-dot"></span>${state.logPaused ? '更新已暂停' : '每 2 秒更新'}`;
     $('log-live').classList.toggle('paused',state.logPaused);
+    updateLogContext();
     if (!state.logPaused) loadLogs();
   });
   async function loadLogs() {
     if (state.logLoading || state.logPaused) return;
     state.logLoading = true;
+    updateLogContext(true);
     const generation = state.logGeneration;
     const params = new URLSearchParams({after:String(state.cursor),limit:'200',level:$('log-level').value,stage:$('log-stage').value.trim(),q:$('log-search').value.trim(),run_id:$('log-run').value});
     try {
@@ -548,10 +610,16 @@
       // ponytail: retain 2,000 visible rows; export provides the server's full retained history.
       while ($('log-rows').childElementCount > 2000) { $('log-rows').firstElementChild.remove(); showMessage('log-reset-notice','浏览器仅展示最近 2,000 条已读取记录，以保持界面流畅。完整保留历史可通过「导出日志」获取。'); }
       $('log-empty').hidden = $('log-rows').childElementCount > 0;
+      updateLogContext();
       $('log-count').textContent = `${$('log-rows').childElementCount} 条显示 · 已读取 ${state.logCount} 条 · 游标 ${state.cursor}`;
       showMessage('logs-error','');
       if ($('log-autoscroll').checked && (result.items || []).length) $('log-view').scrollTop = $('log-view').scrollHeight;
-    } catch (error) { if (generation === state.logGeneration) showMessage('logs-error',error.message+' 保留现有记录，连接恢复后继续读取。'); }
+    } catch (error) {
+      if (generation === state.logGeneration) {
+        showMessage('logs-error',error.message+' 保留现有记录，连接恢复后继续读取。');
+        if (!$('log-rows').childElementCount) { $('log-empty-title').textContent = '日志读取失败'; $('log-empty-description').textContent = '连接恢复后将自动重试，当前筛选条件会保留。'; }
+      }
+    }
     finally { state.logLoading = false; }
   }
   $('export-logs').addEventListener('click',async () => {

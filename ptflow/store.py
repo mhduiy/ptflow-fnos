@@ -157,6 +157,13 @@ class Store:
             row = db.execute("SELECT * FROM samples ORDER BY time DESC LIMIT 1").fetchone()
             return dict(row) if row else None
 
+    def speed_window(self, minutes):
+        now = time.time()
+        with self.connection() as db:
+            return dict(db.execute("""SELECT COUNT(*) AS samples, MAX(time) AS time,
+                MAX(dlspeed) AS peak_download, AVG(upspeed) AS average_upload
+                FROM samples WHERE time BETWEEN ? AND ?""", (now - minutes * 60, now)).fetchone())
+
     def history(self, minutes=60):
         with self.connection() as db:
             rows = [dict(row) for row in db.execute("SELECT * FROM samples WHERE time>=? ORDER BY time", (time.time() - min(max(minutes, 1), 10080) * 60,))]

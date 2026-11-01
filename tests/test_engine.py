@@ -56,6 +56,9 @@ class Simulator:
         self.priority_ignored = False
         self.resume_budgets = []
         self.headers = []
+        self.files_status = 200
+        self.search_delay = 0
+        self.stopped = threading.Event()
         fixture = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -87,6 +90,7 @@ class Simulator:
                 fixture.calls.append(path)
                 fixture.headers.append((path, dict(self.headers)))
                 if path == "/api/torrent/search":
+                    time.sleep(fixture.search_delay)
                     rows = [{"id": str(i), "name": f"candidate-{i}", "size": 32 * MIB,
                              "status": {"discount": "FREE", "seeders": 2, "leechers": 10 - i,
                                         "discountEndTime": "2099-01-01 00:00:00"}}
@@ -148,7 +152,7 @@ class Simulator:
                     self.reply({"success_count": 1, "pending_count": 0, "failure_count": 0,
                                 "added_torrent_ids": [torrent_hash]}, fixture.add_status)
                 elif path == "/api/v2/torrents/files":
-                    self.reply(fixture.files[query["hash"][0]])
+                    self.reply(fixture.files[query["hash"][0]], fixture.files_status)
                 elif path == "/api/v2/torrents/filePrio":
                     indexes = set(map(int, data["id"][0].split("|")))
                     if not fixture.priority_ignored:
@@ -164,6 +168,8 @@ class Simulator:
                     self.reply(b"")
                 elif path in ("/api/v2/torrents/stop", "/api/v2/torrents/pause"):
                     fixture.rows[data["hashes"][0]]["state"] = "stoppedDL"
+                    fixture.rows[data["hashes"][0]]["dlspeed"] = 0
+                    fixture.stopped.set()
                     self.reply(b"")
                 elif path == "/api/v2/torrents/delete":
                     fixture.rows.pop(data["hashes"][0], None)
@@ -363,12 +369,94 @@ class EngineTests(unittest.TestCase):
         self.assertIn("/api/v2/torrents/resume", self.sim.calls)
         self.assertNotIn("/api/v2/torrents/start", self.sim.calls)
 
-    def test_query_wait_occurs_only_between_modes_and_invalid_expiry_skips(self):
-        self.config["mteam"]["modes"] = ["movie", "normal"]
-        self.config["mteam"]["request_interval_seconds"] = 7
-        with patch("ptflow.engine.time.sleep") as sleep:
-            self.engine.query()
-        sleep.assert_called_once_with(7)
+    def managed_download(self, free_until):
+        metadata = torrent_metadata(torrent("99")[0])
+        old = time.time() - 90000
+        record = {"id": "99", "name": "managed-99", "size": metadata["size"], "seeders": 2,
+                  "leechers": 3, "free_until": free_until, "score": 1, "mode": "movie", "state": "submitted"}
+        self.store.upsert_candidate(record)
+        self.store.update_candidate("99", state="submitted", qb_hash=metadata["hash"], submitted_at=old, last_activity=old)
+        self.sim.rows[metadata["hash"]] = {"hash": metadata["hash"], "category": "ptflow", "tags": "ptflow-id-99",
+                                           "name": "managed-99", "state": "downloading", "progress": 0,
+                                           "upspeed": 0, "dlspeed": 1, "added_on": old, "completion_on": 0,
+                                           "size": metadata["size"], "uploaded": 0, "downloaded": 0, "ratio": 0,
+                                           "last_activity": 0}
+        self.sim.files[metadata["hash"]] = [{"index": index, "size": size, "priority": 1, "progress": 0}
+                                           for index, size in enumerate(metadata["lengths"])]
+        return metadata["hash"]
+
+    def test_readded_untagged_torrent_is_never_claimed_or_deleted(self):
+        torrent_hash = self.managed_download(time.time() + 86400)
+        self.sim.rows[torrent_hash].update(tags="manual", state="stalledUP", progress=1, dlspeed=0)
+        self.config["strategy"].update(cleanup_enabled=True, delete_files=True, protect_seed_hours=1, idle_minutes=5)
+        outcome = self.engine.cleanup()
+        self.assertEqual(outcome["counts"]["deleted"], 0)
+        self.assertIn(torrent_hash, self.sim.rows)
+        self.assertEqual(self.engine.torrents(), [])
+
+    def test_failed_free_file_read_stops_download_and_blocks_new_adds(self):
+        self.query()
+        torrent_hash = self.managed_download(time.time() + 10)
+        self.sim.files_status = 503
+        outcome = self.engine.brush()
+        self.assertEqual(self.sim.rows[torrent_hash]["state"], "stoppedDL")
+        self.assertEqual(self.sim.adds, [])
+        self.assertGreater(outcome["counts"]["failed"], 0)
+        self.assertEqual(outcome["status"], "failed")
+
+    def test_full_sampling_window_preserves_download_peak_and_upload_average(self):
+        self.query()
+        self.config["strategy"]["speed_window_minutes"] = 90
+        self.config["schedule"]["stats_seconds"] = 5
+        for field, rate in (("dlspeed", 100 * MIB), ("upspeed", self.config["strategy"]["target_upload_mib"] * MIB * 1003)):
+            with self.subTest(field=field):
+                with self.store.connection() as db:
+                    db.execute("DELETE FROM samples")
+                beginning = time.time() - 5005
+                for index in range(1001):
+                    sample = {"time": beginning + index * 5, "upspeed": 0, "dlspeed": 0,
+                              "uploaded": 1, "downloaded": 2, "free_space": 100 * GIB}
+                    sample[field] = rate if index == 1 else 0
+                    self.store.sample(sample)
+                self.assertIsNotNone(self.engine._gate(self.store.latest_sample(), [])[0])
+                self.assertEqual(self.engine.brush()["status"], "skipped")
+                self.assertEqual(self.sim.adds, [])
+
+    def assert_protection_during_query(self, *, response_delay=0, request_gap=0):
+        self.config["strategy"]["min_free_hours"] = 0.01
+        self.config["schedule"]["stats_seconds"] = 5
+        self.config["mteam"].update(modes=["movie", "normal"] if request_gap else ["movie"],
+                                     request_interval_seconds=request_gap)
+        self.sim.search_delay = response_delay
+        torrent_hash = self.managed_download(time.time() + 37)
+        finished = threading.Event()
+        failures = []
+        def execute():
+            try:
+                self.engine.query()
+            except Exception as error:
+                failures.append(error)
+            finally:
+                finished.set()
+        worker = threading.Thread(target=execute)
+        worker.start()
+        try:
+            self.assertTrue(self.sim.stopped.wait(6), "Free protection was blocked by query")
+            self.assertFalse(finished.is_set(), "Protection must run while the query is still waiting")
+        finally:
+            worker.join(12)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(failures, [])
+        self.assertTrue(all(file["priority"] == 0 for file in self.sim.files[torrent_hash]))
+        self.assertEqual(self.sim.rows[torrent_hash]["state"], "stalledUP")
+
+    def test_query_protects_download_during_slow_site_response(self):
+        self.assert_protection_during_query(response_delay=7)
+
+    def test_query_protects_download_during_request_interval(self):
+        self.assert_protection_during_query(request_gap=7)
+
+    def test_invalid_free_expiry_is_rejected(self):
         with self.assertRaises(ValueError):
             candidate({"id": "1", "status": {"discount": "FREE"}}, "movie", time.time())
 
