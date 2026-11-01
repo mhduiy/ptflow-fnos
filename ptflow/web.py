@@ -32,7 +32,12 @@ class GatewayPrefix:
 
     def __call__(self, environ, start_response):
         path = environ.get("PATH_INFO", "")
-        if self.prefix and (path == self.prefix or path.startswith(self.prefix + "/")):
+        if self.prefix and path == self.prefix:
+            query = environ.get("QUERY_STRING", "")
+            location = self.prefix + "/" + ("?" + query if query else "")
+            start_response("308 Permanent Redirect", [("Location", location), ("Content-Length", "0")])
+            return [b""]
+        if self.prefix and path.startswith(self.prefix + "/"):
             environ["SCRIPT_NAME"] = self.prefix
             environ["PATH_INFO"] = path[len(self.prefix):] or "/"
         return self.application(environ, start_response)
@@ -72,7 +77,7 @@ def create_app(data_dir, gateway_prefix="", start_scheduler=True):
             if parsed.scheme not in ("http", "https") or parsed.netloc.lower() != request.host.lower():
                 return jsonify(error="请求来源不匹配，请从 PTFlow 页面操作"), 403
             supplied = request.headers.get("X-CSRF-Token", "")
-            if not supplied or not hmac.compare_digest(supplied, session.get("csrf_token", "")):
+            if not supplied or not supplied.isascii() or not hmac.compare_digest(supplied, session.get("csrf_token", "")):
                 return jsonify(error="安全令牌已过期，请刷新页面后重试"), 403
             if not request.is_json:
                 return jsonify(error="请使用 JSON 请求"), 415
@@ -95,7 +100,10 @@ def create_app(data_dir, gateway_prefix="", start_scheduler=True):
             return jsonify(error=error.description), error.code
         if isinstance(error, ValueError):
             return jsonify(error=store.redact(str(error))), 400
-        store.event("ERROR", "Web", f"请求失败：{request.path}；{type(error).__name__}：{error}")
+        try:
+            store.event("ERROR", "Web", f"请求失败：{request.path}；{type(error).__name__}：{error}")
+        except Exception as log_error:
+            app.logger.error(store.redact(f"错误日志写入失败：{type(log_error).__name__}：{log_error}"))
         return jsonify(error=store.redact(f"操作失败：{type(error).__name__}：{error}")), 500
 
     def body():
@@ -108,7 +116,16 @@ def create_app(data_dir, gateway_prefix="", start_scheduler=True):
         session.clear()
         session.update(authenticated=True, generation=config.auth["generation"], csrf_token=secrets.token_urlsafe(32))
         session.permanent = True
-        return jsonify(authenticated=True, csrf_token=session["csrf_token"])
+        return {"authenticated": True, "csrf_token": session["csrf_token"]}
+
+    def committed_response(result, stage, message, details=None):
+        try:
+            store.event("INFO", stage, message, details=details)
+        except Exception as error:
+            warning = store.redact(f"{message}；但日志写入失败：{type(error).__name__}：{error}。已保存内容不会回滚。")
+            app.logger.error(warning)
+            return jsonify(error=warning, committed=True, result=result), 500
+        return jsonify(result)
 
     def validate_password(password):
         if not isinstance(password, str) or not 10 <= len(password) <= 256:
@@ -151,8 +168,7 @@ def create_app(data_dir, gateway_prefix="", start_scheduler=True):
             if config.auth["password_hash"]:
                 return jsonify(error="初始化已完成，请登录"), 409
             config.set_password_hash(generate_password_hash(password))
-        store.event("INFO", "安全", "已设置管理密码；自动刷流仍需在配置页主动开启")
-        return establish_session()
+        return committed_response(establish_session(), "安全", "管理密码已设置；自动刷流仍需在配置页主动开启")
 
     @app.post("/api/login")
     def login():
@@ -161,7 +177,7 @@ def create_app(data_dir, gateway_prefix="", start_scheduler=True):
         password = body().get("password", "")
         if not isinstance(password, str) or len(password) > 256 or not config.auth["password_hash"] or not check_password_hash(config.auth["password_hash"], password):
             return jsonify(error="管理密码不正确"), 401
-        return establish_session()
+        return jsonify(establish_session())
 
     @app.post("/api/logout")
     def logout():
@@ -175,8 +191,7 @@ def create_app(data_dir, gateway_prefix="", start_scheduler=True):
         if not isinstance(current, str) or len(current) > 256 or not check_password_hash(config.auth["password_hash"], current):
             return jsonify(error="当前密码不正确"), 403
         config.set_password_hash(generate_password_hash(validate_password(value.get("password"))))
-        store.event("INFO", "安全", "管理密码已更新，其他会话已失效")
-        return establish_session()
+        return committed_response(establish_session(), "安全", "管理密码已更新，其他会话已失效")
 
     @app.get("/api/config")
     def get_config():
@@ -188,8 +203,8 @@ def create_app(data_dir, gateway_prefix="", start_scheduler=True):
         result = config.save(body())
         store.secrets = list(set(store.secrets + old_secrets + config.secrets()))
         scheduler.reschedule()
-        store.event("INFO", "配置", "配置已保存并重排下一次执行时间；正在运行的任务继续使用启动时配置", details={"query_minutes": result["schedule"]["query_minutes"], "brush_minutes": result["schedule"]["brush_minutes"], "automatic": result["schedule"]["enabled"]})
-        return jsonify(result)
+        return committed_response(result, "配置", "配置已保存并重排下一次执行时间；正在运行的任务继续使用启动时配置",
+                                  {"query_minutes": result["schedule"]["query_minutes"], "brush_minutes": result["schedule"]["brush_minutes"], "automatic": result["schedule"]["enabled"]})
 
     @app.post("/api/test")
     def test_connection():
@@ -256,14 +271,18 @@ def create_app(data_dir, gateway_prefix="", start_scheduler=True):
         after = integer_argument("after", 0, 0, 2**63 - 1)
         limit = integer_argument("limit", 200, 1, 500)
         oldest, newest = store.event_bounds()
-        reset = bool(after and oldest and after < oldest - 1)
+        rewound = after > newest
+        reset = rewound or bool(after and oldest and after < oldest - 1)
+        if rewound:
+            after = 0
         items = store.events(after, limit, request.args.get("level", ""), request.args.get("stage", ""), request.args.get("q", "")[:256], request.args.get("run_id", ""))
         cursor = items[-1]["id"] if items else max(after, newest)
-        return jsonify(items=items, cursor=cursor, oldest_id=oldest, reset=reset)
+        return jsonify(items=items, cursor=cursor, oldest_id=oldest, reset=reset,
+                       reset_reason="rewound" if rewound else "retention" if reset else None)
 
     @app.get("/api/logs/export")
     def export_logs():
-        rows = store.events(limit=10000)
+        rows = store.events(limit=10099)
         text = "\n".join(f"{row['time']} [{row['level']}] [{row['stage']}] run={row['run_id'] or '-'} {row['message']} {row['details']}" for row in rows) + "\n"
         return send_file(io.BytesIO(text.encode()), mimetype="text/plain; charset=utf-8", as_attachment=True, download_name="ptflow-logs.txt")
 

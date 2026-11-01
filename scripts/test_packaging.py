@@ -13,6 +13,7 @@ import tarfile
 import tempfile
 import threading
 import unittest
+from types import SimpleNamespace
 import zlib
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -41,6 +42,43 @@ class PackagingTests(unittest.TestCase):
             lifecycle.rotate_startup_log(path, limit=6)
             self.assertEqual(path.read_bytes(), b"new")
             self.assertEqual(path.with_suffix(".log.old").read_bytes(), b"latest")
+
+    def test_corrupt_record_stop_recovers_stale_gateway_without_a_signal(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manager = object.__new__(lifecycle.Lifecycle)
+            manager.data = root / "data"
+            manager.socket = root / "ptflow.sock"
+            manager.link = root / "app.sock"
+            manager.record_path = root / "process.json"
+            manager.python = "/isolated/python3"
+            manager.command = [manager.python, "-m", "ptflow"]
+            manager.user = SimpleNamespace(pw_uid=os.getuid())
+            for damaged in (b"{", b"[]", b"null", b'{"service":{}}', b"\xff"):
+                with self.subTest(damaged=damaged):
+                    manager.record_path.write_bytes(damaged)
+                    manager.link.symlink_to(manager.socket)
+                    self.assertIsNone(manager.read_record())
+                    manager.stop()
+                    self.assertFalse(manager.record_path.exists())
+                    self.assertFalse(manager.link.is_symlink())
+
+    def test_startup_log_symlinks_never_modify_external_data(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            external = root / "download.bin"
+            external.write_bytes(b"download data")
+            path = root / "ptflow.log"
+            path.symlink_to(external)
+            with self.assertRaises(RuntimeError):
+                lifecycle.rotate_startup_log(path, limit=6)
+            path.unlink()
+            path.write_bytes(b"oversized log")
+            path.with_suffix(".log.old").symlink_to(external)
+            with self.assertRaises(RuntimeError):
+                lifecycle.rotate_startup_log(path, limit=6)
+            self.assertEqual(external.read_bytes(), b"download data")
+            self.assertEqual(path.read_bytes(), b"oversized log")
 
     def test_generated_original_png_and_nested_app_archive(self):
         image = build.icon_png(64)

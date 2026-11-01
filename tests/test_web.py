@@ -35,6 +35,8 @@ class WebBehaviorTests(TestCase):
     def test_auth_requires_origin_and_token_and_invalidates_other_sessions(self):
         self.assertEqual(self.client.get("/api/config").status_code, 401)
         self.assertEqual(self.client.post("/api/setup", json={"password": "local-safe-password"}).status_code, 403)
+        self.assertEqual(self.client.post("/api/setup", json={},
+                                         headers={**self.origin, "X-CSRF-Token": "é"}).status_code, 403)
         self.setup_login()
         other = self.app.test_client()
         other_token = other.get("/api/auth").json["csrf_token"]
@@ -66,6 +68,32 @@ class WebBehaviorTests(TestCase):
         self.assertEqual(self.client.put("/api/config", json={"mteam": {"url": "http://untrusted.example"}}, headers=headers).status_code, 400)
         self.assertEqual(Path(self.temporary.name, "config.json").stat().st_mode & 0o777, 0o600)
 
+    def test_committed_writes_survive_failed_audit_write(self):
+        old_secret, new_secret = "audit-old-managed-secret", "audit-new-managed-secret"
+        with redirect_stdout(StringIO()):
+            response = self.post("/api/setup", {"password": old_secret})
+        self.assertEqual(response.status_code, 200)
+        self.token = response.json["csrf_token"]
+        store = self.app.extensions["ptflow_store"]
+        with store.connection() as db:
+            db.execute("CREATE TRIGGER audit_failure BEFORE INSERT ON events BEGIN SELECT RAISE(ABORT, 'audit unavailable'); END")
+        response = self.client.put("/api/config", json={"schedule": {"query_minutes": 47}},
+                                   headers={**self.origin, "X-CSRF-Token": self.token})
+        self.assertEqual(response.status_code, 500)
+        self.assertTrue(response.json["committed"])
+        self.assertEqual(response.json["result"]["schedule"]["query_minutes"], 47)
+        self.assertTrue(response.json["error"])
+        self.assertEqual(Config(self.temporary.name).get()["schedule"]["query_minutes"], 47)
+        response = self.post("/api/password", {"current_password": old_secret, "password": new_secret})
+        self.assertEqual(response.status_code, 500)
+        self.assertTrue(response.json["committed"])
+        self.assertTrue(response.json["result"]["authenticated"])
+        self.token = response.json["result"]["csrf_token"]
+        self.assertTrue(self.client.get("/api/auth").json["authenticated"])
+        self.assertEqual(self.post("/api/logout", {}).status_code, 200)
+        self.token = self.client.get("/api/auth").json["csrf_token"]
+        self.assertEqual(self.post("/api/login", {"password": new_secret}).status_code, 200)
+
     def test_logs_filter_paginate_without_missing_rows_or_leaking_secrets(self):
         self.setup_login()
         store = self.app.extensions["ptflow_store"]
@@ -88,6 +116,37 @@ class WebBehaviorTests(TestCase):
         response = self.client.get(f"/api/logs?after={before}")
         self.assertTrue(response.json["reset"])
         self.assertEqual([row["id"] for row in response.json["items"] if row["level"] == "ERROR"], identifiers[-2:])
+
+    def test_logs_reset_cursor_after_empty_or_older_database_restore(self):
+        self.setup_login()
+        store = self.app.extensions["ptflow_store"]
+        response = self.client.get("/api/logs?after=9000").json
+        self.assertTrue(response["reset"])
+        self.assertEqual(response["reset_reason"], "rewound")
+        self.assertEqual(response["cursor"], store.event_bounds()[1])
+        with store.connection() as db:
+            db.execute("DELETE FROM events")
+        response = self.client.get("/api/logs?after=9000").json
+        self.assertTrue(response["reset"])
+        self.assertEqual(response["cursor"], 0)
+        with redirect_stdout(StringIO()):
+            identifier = store.event("INFO", "恢复", "restored event")
+        response = self.client.get("/api/logs?after=0").json
+        self.assertEqual([row["id"] for row in response["items"]], [identifier])
+
+    def test_export_includes_entire_retained_history_independent_of_filters(self):
+        self.setup_login()
+        store = self.app.extensions["ptflow_store"]
+        with redirect_stdout(StringIO()):
+            for index in range(10097):
+                store.event("INFO", "保留", f"retained-{index}")
+        with store.connection() as db:
+            retained = db.execute("SELECT message FROM events ORDER BY id").fetchall()
+        self.assertEqual(len(retained), 10098)
+        exported = self.client.get("/api/logs/export?level=ERROR&q=missing").get_data(as_text=True)
+        self.assertEqual(len(exported.splitlines()), len(retained))
+        self.assertIn(retained[0]["message"], exported)
+        self.assertIn(retained[-1]["message"], exported)
 
     def test_cross_midnight_window_has_exclusive_end(self):
         config = self.app.extensions["ptflow_config"].get()
@@ -118,6 +177,14 @@ class WebBehaviorTests(TestCase):
             app = create_app(data_dir, gateway_prefix="/app/ptflow-fnos", start_scheduler=False)
             client = app.test_client()
             forwarded = {"X-Forwarded-Host": "nas.example", "X-Forwarded-Proto": "https"}
+            response = client.get("/app/ptflow-fnos?from=desktop", headers={"Host": "untrusted.example"})
+            self.assertEqual(response.status_code, 308)
+            self.assertEqual(response.headers["Location"], "/app/ptflow-fnos/?from=desktop")
+            for path in (response.headers["Location"], "/app/ptflow-fnos/static/app.js", "/static/app.js"):
+                with client.get(path) as resource:
+                    self.assertEqual(resource.status_code, 200)
+            self.assertEqual(client.get("/api/auth").status_code, 200)
+            client = app.test_client()
             response = client.get("/app/ptflow-fnos/api/auth", headers=forwarded)
             self.assertIn("Secure", response.headers["Set-Cookie"])
             self.assertIn("Path=/app/ptflow-fnos/", response.headers["Set-Cookie"])

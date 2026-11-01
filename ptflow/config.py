@@ -45,7 +45,7 @@ def validate_config(value, previous=None):
                 if not isinstance(item, str) or len(item) > 2048 or any(ord(c) < 32 for c in item):
                     raise ValueError(f"{section}.{key} 必须是无控制字符的文本，最多 2048 字符")
             elif isinstance(default, (int, float)):
-                if isinstance(item, bool) or not isinstance(item, (int, float)) or not math.isfinite(item):
+                if isinstance(item, bool) or not isinstance(item, (int, float)) or (isinstance(item, float) and not math.isfinite(item)):
                     raise ValueError(f"{section}.{key} 必须是有效数字")
     integer_ranges = {
         "mteam.request_interval_seconds": (1, 600), "mteam.page_size": (1, 200),
@@ -72,6 +72,7 @@ def validate_config(value, previous=None):
         raise ValueError("请选择至少一个有效、无重复的 M-Team 查询分类")
     for section in ("downloader", "mteam"):
         url = result[section]["url"].strip().rstrip("/")
+        result[section]["url"] = url
         if not url and section == "downloader":
             continue
         try:
@@ -83,7 +84,6 @@ def validate_config(value, previous=None):
             raise ValueError(f"{section} 地址须为不含凭证、查询参数的 HTTP(S) 地址")
         if section == "mteam" and parsed.scheme != "https" and parsed.hostname not in ("localhost", "127.0.0.1", "::1"):
             raise ValueError("M-Team 必须使用 HTTPS 保护 API Key")
-        result[section]["url"] = url
     schedule = result["schedule"]
     for key in ("work_start", "work_end"):
         try:
@@ -167,6 +167,6 @@ class Config:
 
     def set_password_hash(self, password_hash):
         with self.lock:
-            self.auth["password_hash"] = password_hash
-            self.auth["generation"] += 1
-            atomic_json(self.auth_path, self.auth)
+            new = {**self.auth, "password_hash": password_hash, "generation": self.auth["generation"] + 1}
+            atomic_json(self.auth_path, new)
+            self.auth = new

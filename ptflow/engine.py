@@ -2,6 +2,7 @@
 
 from datetime import datetime
 import math
+import logging
 import time
 from threading import Event, Thread
 from zoneinfo import ZoneInfo
@@ -79,9 +80,10 @@ def matching(rows, expected, identity):
 
 
 class Engine:
-    def __init__(self, config, store, progress):
+    def __init__(self, config, store, progress, stopping=None):
         self.config, self.store, self.progress = config, store, progress
         self.strategy = config["strategy"]
+        self.stopping = stopping
 
     def _event(self, level, stage, message, details=None):
         safe = self.store.redact(message)
@@ -115,9 +117,14 @@ class Engine:
                     try:
                         outcome = engine.collect()
                         counts["protection_failed"] += outcome["counts"]["failed"]
-                    except IntegrationError as error:
+                    except Exception as error:
                         counts["protection_failed"] += 1
-                        engine._event("ERROR", "free.protect", str(error))
+                        message = self.store.redact(f"Free 保护检查失败：{type(error).__name__}：{error}")
+                        logging.getLogger(__name__).error(message)
+                        try:
+                            engine._event("ERROR", "free.protect", message)
+                        except Exception as log_error:
+                            logging.getLogger(__name__).error(self.store.redact(f"Free 保护错误日志持久化失败：{type(log_error).__name__}：{log_error}"))
 
         try:
             modes = settings["modes"]
@@ -130,7 +137,10 @@ class Engine:
                 if index:
                     delay = settings["request_interval_seconds"]
                     self._event("INFO", "query.wait", "主动请求间隔；不是 HTTP 限流", {"seconds": delay, "next_mode": mode})
-                    time.sleep(delay)
+                    if self.stopping is None:
+                        time.sleep(delay)
+                    elif self.stopping.wait(delay):
+                        raise InterruptedError("应用停止，查询请求间隔已中断；未继续查询站点")
                 self._event("INFO", "query.mode", "开始查询分类", {"mode": mode, "page_size": settings["page_size"]})
                 try:
                     rows = mt.search(mode, settings["page_size"])

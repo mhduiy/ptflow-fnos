@@ -1,13 +1,17 @@
 """Runnable real-HTTP regression checks: python -m unittest discover -s tests."""
 
+from contextlib import closing, redirect_stderr
 from copy import deepcopy
 from email.parser import BytesParser
 from email.policy import default
+import io
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
+import socket
 from pathlib import Path
+import sqlite3
 import tempfile
 import threading
 import time
@@ -62,6 +66,12 @@ class Simulator:
         self.headers = []
         self.files_status = 200
         self.search_delay = 0
+        self.statuses = {}
+        self.add_delay = 0
+        self.disconnect_add = False
+        self.server_state = {"up_info_speed": 0, "dl_info_speed": 0,
+                             "alltime_ul": 1234, "alltime_dl": 5678,
+                             "free_space_on_disk": 100 * GIB}
         self.stopped = threading.Event()
         fixture = self
 
@@ -93,6 +103,9 @@ class Simulator:
                 query = parse_qs(parsed.query)
                 fixture.calls.append(path)
                 fixture.headers.append((path, dict(self.headers)))
+                if path in fixture.statuses:
+                    self.reply(b"simulated HTTP failure", fixture.statuses[path])
+                    return
                 if path == "/api/torrent/search":
                     time.sleep(fixture.search_delay)
                     rows = [{"id": str(i), "name": f"candidate-{i}", "size": 32 * MIB,
@@ -124,9 +137,7 @@ class Simulator:
                         return
                     self.reply(fixture.version.encode())
                 elif path == "/api/v2/sync/maindata":
-                    self.reply({"server_state": {"up_info_speed": 0, "dl_info_speed": 0,
-                                                 "alltime_ul": 1234, "alltime_dl": 5678,
-                                                 "free_space_on_disk": 100 * GIB}})
+                    self.reply({"server_state": fixture.server_state})
                 elif path == "/api/v2/torrents/info":
                     if fixture.invalid_confirmation and fixture.adds:
                         self.reply({"invalid": True})
@@ -157,6 +168,11 @@ class Simulator:
                     }
                     fixture.files[torrent_hash] = [{"index": i, "size": n, "priority": 1, "progress": 0}
                                                   for i, n in enumerate(metadata["lengths"])]
+                    if fixture.disconnect_add:
+                        self.connection.shutdown(socket.SHUT_RDWR)
+                        self.connection.close()
+                        return
+                    time.sleep(fixture.add_delay)
                     self.reply({"success_count": 1, "pending_count": 0, "failure_count": 0,
                                 "added_torrent_ids": [torrent_hash]}, fixture.add_status)
                 elif path == "/api/v2/torrents/files":
@@ -477,6 +493,61 @@ class EngineTests(unittest.TestCase):
 
     def test_query_protects_download_during_request_interval(self):
         self.assert_protection_during_query(request_gap=7)
+
+    def test_query_protection_storage_failure_is_not_reported_as_success(self):
+        self.config["schedule"]["stats_seconds"] = 5
+        self.sim.search_delay = 7
+        torrent_hash = self.managed_download(time.time() + 1)
+        with closing(sqlite3.connect(":memory:")) as db:
+            db.execute("CREATE TABLE data(value BLOB)")
+            pages = db.execute("PRAGMA page_count").fetchone()[0]
+            db.execute(f"PRAGMA max_page_count={pages}")
+            try:
+                db.execute("INSERT INTO data VALUES(zeroblob(1048576))")
+            except sqlite3.Error as error:
+                fault = error
+            else:
+                self.fail("SQLite FULL fault did not occur")
+        stderr = io.StringIO()
+        with patch.object(self.store, "sample", side_effect=fault), redirect_stderr(stderr):
+            outcome = self.engine.query()
+        self.assertEqual(outcome["status"], "partial")
+        self.assertGreater(outcome["counts"]["protection_failed"], 0)
+        self.assertIn("database or disk is full", stderr.getvalue())
+        recovered = self.engine.collect()
+        self.assertEqual(recovered["counts"]["protected"], 1)
+        self.assertTrue(all(file["priority"] == 0 for file in self.sim.files[torrent_hash]))
+        self.assertEqual(self.sim.adds, [])
+
+    def test_accepted_add_disconnect_reconciles_after_restart_without_readding(self):
+        self.query()
+        self.config["strategy"]["max_downloading"] = 1
+        self.sim.disconnect_add = True
+        outcome = self.engine.brush()
+        self.assertEqual(outcome["status"], "partial")
+        first = next(c for c in self.store.candidates() if c["id"] == "1")
+        self.assertEqual(first["state"], "uncertain")
+        self.assertTrue(first["qb_hash"])
+        self.assertFalse(first["submitted_at"])
+        self.assertEqual(self.sim.adds, ["1"])
+        self.assertEqual(self.sim.resume_budgets, [])
+        self.sim.disconnect_add = False
+        restarted = Engine(self.config, Store(Path(self.directory.name)), lambda *args: None)
+        recovered = restarted.brush()
+        self.assertEqual(recovered["counts"]["reconciled"], 1)
+        self.assertEqual(self.sim.adds, ["1"])
+        self.assertEqual(self.sim.resume_budgets, [12 * MIB])
+
+    def test_global_incomplete_manual_queued_tasks_block_additions(self):
+        self.query()
+        self.config["strategy"]["max_downloading"] = 1
+        torrent_hash = self.managed_download(time.time() + 86400)
+        for state in ("queuedDL", "checkingDL", "stalledDL", "downloading", "metaDL"):
+            with self.subTest(state=state):
+                self.sim.rows[torrent_hash].update(tags="manual", category="manual", state=state, dlspeed=0)
+                outcome = self.engine.brush()
+                self.assertEqual(outcome["status"], "skipped")
+                self.assertEqual(self.sim.adds, [])
 
     def test_invalid_free_expiry_is_rejected(self):
         with self.assertRaises(ValueError):

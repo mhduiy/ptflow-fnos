@@ -48,6 +48,8 @@
     if (!response.ok) {
       const error = new Error(result.error || `请求失败（HTTP ${response.status}）`);
       error.status = response.status;
+      error.committed = result.committed === true;
+      error.result = result.result;
       if (response.status === 401 && state.authenticated && !['login','password'].includes(path)) {
         state.authenticated = false;
         clearTimeout(state.timer);
@@ -118,7 +120,16 @@
       state.setup = auth.setup_required;
       if (!state.authenticated) throw new Error('登录会话未建立，请检查浏览器 Cookie 设置。');
       await openApp();
-    } catch (error) { showMessage('auth-error',error.message); }
+    } catch (error) {
+      if (error.committed && error.result?.authenticated) {
+        state.csrf = error.result.csrf_token;
+        state.authenticated = true;
+        state.setup = false;
+        $('auth-form').reset();
+        await openApp();
+        toast(error.message,true);
+      } else showMessage('auth-error',error.message);
+    }
     finally { button.disabled = false; }
   });
   $('logout').addEventListener('click',async () => {
@@ -267,7 +278,14 @@
       showMessage('config-error','');
       toast('设置已保存，计划已更新。');
       await loadStatus();
-    } catch (error) { $('save-message').textContent = error.message; $('save-message').classList.add('error'); }
+    } catch (error) {
+      if (error.committed && error.result) {
+        acceptConfig(error.result,state.revision === revision);
+        await loadStatus();
+      }
+      $('save-message').textContent = error.message;
+      $('save-message').classList.add('error');
+    }
     finally { $('save-config').disabled = !state.config; $('save-config').textContent = '保存设置'; }
   });
   document.querySelectorAll('[data-test]').forEach(button => button.addEventListener('click',async () => {
@@ -316,7 +334,14 @@
       state.csrf = auth.csrf_token || '';
       $('password-form').reset();
       output.textContent = '工作台密码已更新。';
-    } catch (error) { output.textContent = error.message; output.classList.add('error'); }
+    } catch (error) {
+      if (error.committed && error.result?.authenticated) {
+        state.csrf = error.result.csrf_token;
+        $('password-form').reset();
+      }
+      output.textContent = error.message;
+      output.classList.add('error');
+    }
     finally { button.disabled = false; }
   });
   async function loadStatus() {
@@ -604,7 +629,7 @@
       if (result.reset) {
         $('log-rows').replaceChildren();
         state.logCount = 0;
-        showMessage('log-reset-notice',`较早日志已超出服务端保留范围。已从当前可用历史继续读取（最早 ID ${result.oldest_id ?? '—'}）；中间记录无法恢复。`);
+        showMessage('log-reset-notice',result.reset_reason === 'rewound' ? '服务端日志游标已回退或重置。已重新读取当前可用历史；原有记录可能不再存在。' : `较早日志已超出服务端保留范围。已从当前可用历史继续读取（最早 ID ${result.oldest_id ?? '—'}）；中间记录无法恢复。`);
       }
       const fragment = document.createDocumentFragment();
       for (const item of result.items || []) {

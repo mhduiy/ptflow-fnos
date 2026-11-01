@@ -111,7 +111,7 @@ class Store:
             values.extend((q, q))
         order = "ASC" if after else "DESC"
         with self.connection() as db:
-            rows = db.execute(f"SELECT * FROM events WHERE {' AND '.join(clauses)} ORDER BY id {order} LIMIT ?", (*values, min(max(1, limit), 10000))).fetchall()
+            rows = db.execute(f"SELECT * FROM events WHERE {' AND '.join(clauses)} ORDER BY id {order} LIMIT ?", (*values, min(max(1, limit), 10099))).fetchall()
         result = [dict(row) for row in rows]
         if not after:
             result.reverse()

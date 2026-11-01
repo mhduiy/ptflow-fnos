@@ -2,6 +2,7 @@
 from copy import deepcopy
 from datetime import datetime, timezone
 from threading import Event, RLock, Thread
+import logging
 import time
 import uuid
 
@@ -22,6 +23,7 @@ class Scheduler:
         self.lock = RLock()
         self.wakeup, self.stopping = Event(), Event()
         self.current = None
+        self.last_run = None
         self.worker = None
         self.deadlines = {}
         self.reschedule()
@@ -65,7 +67,10 @@ class Scheduler:
                         self.deadlines[kind] = now + self.intervals(config)[kind]
                     continue
                 if kind in ("query", "brush") and not is_work_time(config):
-                    self.store.event("INFO", "调度", f"跳过{LABELS[kind]}：当前不在工作时段；未查询站点或新增 QB 任务", details={"start": config["schedule"]["work_start"], "end": config["schedule"]["work_end"], "timezone": config["schedule"]["timezone"]})
+                    try:
+                        self.store.event("INFO", "调度", f"跳过{LABELS[kind]}：当前不在工作时段；未查询站点或新增 QB 任务", details={"start": config["schedule"]["work_start"], "end": config["schedule"]["work_end"], "timezone": config["schedule"]["timezone"]})
+                    except Exception as error:
+                        logging.getLogger(__name__).error(self.store.redact(f"调度跳过日志持久化失败：{type(error).__name__}：{error}"))
                     with self.lock:
                         self.deadlines[kind] = now + self.intervals(config)[kind]
                     continue
@@ -104,33 +109,55 @@ class Scheduler:
                 if self.current and self.current["id"] == run["id"]:
                     self.current.update(stage=stage, message=self.store.redact(message))
 
+        def failure(stage, error):
+            run.update(status="failed", message=self.store.redact(f"{stage}失败：{type(error).__name__}：{error}"))
+            # SQLite may be unavailable; stderr and live status must still expose failure.
+            logging.getLogger(__name__).error("PTFlow %s %s", run["id"], run["message"])
+
         counts, results = {}, []
-        with self.store.run_context(run["id"]):
-            self.store.event("INFO", "任务", f"开始{LABELS[run['kind']]}；来源={'手动' if run['source'] == 'manual' else '定时'}", details={"manual_safety": "手动执行仅跳过自动开关和工作时段，其他保护保持生效"})
-            try:
-                engine = Engine(self.config.get(), self.store, progress)
-                kinds = ("query", "collect", "brush", "cleanup") if run["kind"] == "full" else (run["kind"],)
-                for kind in kinds:
-                    progress(LABELS[kind], f"正在执行{LABELS[kind]}")
-                    result = getattr(engine, kind)()
-                    results.append(result)
-                    counts[kind] = result.get("counts", {})
-                    self.store.event("INFO" if result["status"] == "succeeded" else "WARNING", LABELS[kind], result["message"], details={"status": result["status"], "counts": result.get("counts", {})})
-                statuses = {result["status"] for result in results}
-                status = "failed" if statuses == {"failed"} else "partial" if statuses & {"failed", "partial"} else "skipped" if statuses == {"skipped"} else "succeeded"
-                message = "；".join(result["message"] for result in results)
-            except Exception as error:
-                status = "failed"
-                stage = self.current["stage"] if self.current else "未知阶段"
-                message = self.store.redact(f"{stage}失败：{type(error).__name__}：{error}")
-                self.store.event("ERROR", stage, message, details={"counts": counts, "next": "检查本阶段错误与连接测试；未确认的 QB 提交不会被当作成功"})
-            finally:
-                run.update(finished_at=time.time(), status=status, message=message, counts=counts)
-                self.store.finish_run(run)
-                self.store.event("INFO" if status == "succeeded" else "WARNING", "任务", f"{LABELS[run['kind']]}结束：{status}；{message}", details={"seconds": round(run["finished_at"] - run["started_at"], 2), "counts": counts})
-                with self.lock:
-                    self.current = None
-                self.wakeup.set()
+        run.update(status="failed", message="任务未完成", counts=counts)
+        try:
+            with self.store.run_context(run["id"]):
+                try:
+                    self.store.event("INFO", "任务", f"开始{LABELS[run['kind']]}；来源={'手动' if run['source'] == 'manual' else '定时'}", details={"manual_safety": "手动执行仅跳过自动开关和工作时段，其他保护保持生效"})
+                    engine = Engine(self.config.get(), self.store, progress, self.stopping)
+                    kinds = ("query", "collect", "brush", "cleanup") if run["kind"] == "full" else (run["kind"],)
+                    for kind in kinds:
+                        progress(LABELS[kind], f"正在执行{LABELS[kind]}")
+                        result = getattr(engine, kind)()
+                        results.append(result)
+                        counts[kind] = result.get("counts", {})
+                        self.store.event("INFO" if result["status"] == "succeeded" else "WARNING", LABELS[kind], result["message"], details={"status": result["status"], "counts": result.get("counts", {})})
+                    statuses = {result["status"] for result in results}
+                    status = "failed" if statuses == {"failed"} else "partial" if statuses & {"failed", "partial"} else "skipped" if statuses == {"skipped"} else "succeeded"
+                    run.update(status=status, message="；".join(result["message"] for result in results))
+                except Exception as error:
+                    stage = self.current["stage"] if self.current else "未知阶段"
+                    failure(stage, error)
+                    try:
+                        self.store.event("ERROR", stage, run["message"], details={"counts": counts, "next": "检查本阶段错误与连接测试；未确认的 QB 提交不会被当作成功"})
+                    except Exception as log_error:
+                        failure("错误日志持久化", log_error)
+                run["finished_at"] = time.time()
+                try:
+                    self.store.finish_run(run)
+                except Exception as error:
+                    failure("任务结果持久化", error)
+                try:
+                    self.store.event("INFO" if run["status"] == "succeeded" else "WARNING", "任务", f"{LABELS[run['kind']]}结束：{run['status']}；{run['message']}", details={"seconds": round(run["finished_at"] - run["started_at"], 2), "counts": counts})
+                except Exception as error:
+                    failure("结束日志持久化", error)
+                    try:
+                        self.store.finish_run(run)
+                    except Exception as save_error:
+                        failure("任务结果持久化", save_error)
+        finally:
+            run.setdefault("finished_at", time.time())
+            with self.lock:
+                if run["kind"] != "collect" or run["status"] != "succeeded":
+                    self.last_run = deepcopy(run)
+                self.current = None
+            self.wakeup.set()
 
     def status(self):
         config = self.config.get()
@@ -139,9 +166,12 @@ class Scheduler:
         runs = self.store.runs(1)
         with self.lock:
             current = deepcopy(self.current)
+            last_run = deepcopy(self.last_run)
+            if runs and (not last_run or runs[0]["started_at"] > last_run["started_at"]):
+                last_run = runs[0]
             schedules = [{"kind": key, "label": LABELS[key], "interval_seconds": duration, "next_at": iso(self.deadlines[key]) if (key == "collect" and config["downloader"]["url"] or enabled and config["downloader"]["url"]) else None} for key, duration in self.intervals(config).items()]
         return {"version": __version__, "configured": bool(config["downloader"]["url"] and config["mteam"]["api_key"]),
                 "enabled": enabled, "working_time": is_work_time(config), "now": iso(time.time()),
-                "current_run": current, "last_run": runs[0] if runs else None, "schedules": schedules,
+                "current_run": current, "last_run": last_run, "schedules": schedules,
                 "sample": sample, "sample_age_seconds": max(0, time.time() - sample["time"]) if sample else None,
                 "summary": self.store.summary(), "timezone": config["schedule"]["timezone"]}

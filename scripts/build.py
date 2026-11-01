@@ -112,7 +112,7 @@ def build(arch: str, output: Path) -> Path:
     with tempfile.TemporaryDirectory(prefix="ptflow-fpk-") as workspace:
         stage = Path(workspace) / "stage"
         package = Path(workspace) / "package"
-        shutil.copytree(ROOT / "fpk", stage)
+        shutil.copytree(ROOT / "fpk", stage, ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"))
         app = stage / "app"
         with tarfile.open(runtime, "r:gz") as archive:
             archive.extractall(app, filter="data")

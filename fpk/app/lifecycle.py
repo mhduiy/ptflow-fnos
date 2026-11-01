@@ -142,11 +142,27 @@ class Lifecycle:
         self.log.chmod(0o600)
 
     def read_record(self) -> dict | None:
+        if self.record_path.is_symlink():
+            raise RuntimeError("Process record must not be a symlink")
         try:
             record = json.loads(self.record_path.read_text())
-        except FileNotFoundError:
+        except (FileNotFoundError, ValueError, UnicodeError):
             return None
-        service = record.get("service", {})
+        if not isinstance(record, dict) or not isinstance(record.get("service"), dict):
+            return None
+        service = record["service"]
+        if (not isinstance(record.get("data"), str)
+                or type(service.get("pid")) is not int or service["pid"] <= 1
+                or not isinstance(service.get("start"), str) or not service["start"].isascii()
+                or not service["start"].isdecimal()
+                or not isinstance(service.get("exe"), str)
+                or not isinstance(service.get("argv"), list)
+                or not all(isinstance(item, str) for item in service["argv"])
+                or not isinstance(service.get("uids"), list)
+                or len(service["uids"]) != 4
+                or not all(isinstance(item, str) and item.isascii() and item.isdecimal()
+                           for item in service["uids"])):
+            return None
         if (record.get("data") != str(self.data) or service.get("exe") != self.python
                 or service.get("argv") != self.command
                 or service.get("uids") != [str(self.user.pw_uid)] * 4):
@@ -187,7 +203,7 @@ class Lifecycle:
                     time.sleep(0.1)
         if record and process_identity(record["service"]["pid"]) == record["service"]:
             raise RuntimeError("PTFlow process has not stopped; preserving socket and PID record")
-        if not record and health(self.socket):
+        if health(self.socket):
             raise RuntimeError("An untracked live service owns the socket; refusing to replace it")
         self.record_path.unlink(missing_ok=True)
         self.clean_socket()
