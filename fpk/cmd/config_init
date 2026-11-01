@@ -1,0 +1,3 @@
+#!/bin/bash
+set -euo pipefail
+exec "$TRIM_APPDEST/python/bin/python3" -I "$TRIM_APPDEST/lifecycle.py" prepare

@@ -1,0 +1,9 @@
+#!/bin/bash
+set -euo pipefail
+: "${TRIM_PKGVAR:?Missing TRIM_PKGVAR}"
+[[ ! -L "$TRIM_PKGVAR/data" ]] || { echo "Unsafe PTFlow data directory" >&2; exit 1; }
+if [[ "${wizard_delete_data:-false}" == true ]]; then
+    [[ ! -e "$TRIM_PKGVAR/data" ]] || { echo "PTFlow data deletion was not completed" >&2; exit 1; }
+else
+    [[ -d "$TRIM_PKGVAR/data" ]] || { echo "Retained PTFlow data is missing" >&2; exit 1; }
+fi

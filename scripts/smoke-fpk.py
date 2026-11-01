@@ -52,7 +52,6 @@ def check_package(package):
                 with tarfile.open(outer / "app.tgz") as archive:
                     archive.extractall(target, filter="data")
 
-            install_payload()
             environment = dict(os.environ, TRIM_APPDEST=str(target), TRIM_PKGVAR=str(data),
                                TRIM_USERNAME=username, TRIM_GROUPNAME=username,
                                TRIM_TEMP_LOGFILE=str(root / "startup-error.txt"))
@@ -141,10 +140,14 @@ def check_package(package):
                 raise AssertionError(f"{kind} did not finish: {result}")
 
             try:
+                command("install_init")
+                install_payload()
                 command("main", expected=1)
                 lifecycle("status", 3)
                 command("install_callback")
                 command("install_callback")
+                command("config_init")
+                command("config_callback")
                 assert private.stat().st_mode & 0o777 == 0o700
                 lifecycle("start")
                 lifecycle("status")
@@ -346,6 +349,7 @@ finally:
                 command("uninstall_init", extra={"wizard_delete_data": "TRUE"})
                 assert all((private / name).read_bytes() == contents for name, contents in saved.items())
                 assert (private / "ptflow.sqlite3").exists() and (data / "ptflow.log").exists() and archive.exists()
+                command("uninstall_callback", extra={"TRIM_APPDEST": str(root / "removed-target")})
                 command("install_callback")
                 assert simulator.calls == before_calls
                 lifecycle("start")
@@ -357,6 +361,8 @@ finally:
                 command("uninstall_init", extra={"wizard_delete_data": "true"})
                 command("uninstall_init", extra={"wizard_delete_data": "true"})
                 assert not private.exists() and not (data / "ptflow.log").exists() and not archive.exists()
+                command("uninstall_callback", extra={"wizard_delete_data": "true",
+                                                     "TRIM_APPDEST": str(root / "removed-target")})
                 assert unrelated.read_bytes() == b"not PTFlow application data"
                 assert simulator.calls == before_calls and simulator.rows == qb_rows
                 assert (sentinel.read_bytes(), sentinel.stat().st_uid, sentinel.stat().st_mode) == sentinel_snapshot

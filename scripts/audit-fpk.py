@@ -15,8 +15,13 @@ def audit(path: Path):
     with tarfile.open(path, "r:gz") as package:
         files = {member.name: member for member in package.getmembers()}
         for name in ("app.tgz", "manifest", "ICON.PNG", "ICON_256.PNG", "cmd/main",
-                     "config/privilege", "config/resource", "wizard/uninstall"):
+                     "cmd/install_init", "cmd/install_callback", "cmd/upgrade_init",
+                     "cmd/upgrade_callback", "cmd/uninstall_init", "cmd/uninstall_callback",
+                     "cmd/config_init", "cmd/config_callback", "config/privilege",
+                     "config/resource", "wizard/uninstall"):
             assert name in files, f"Missing outer member {name}"
+            if name.startswith("cmd/"):
+                assert files[name].isfile() and files[name].mode & 0o111, f"Invalid lifecycle entry {name}"
         manifest = package.extractfile(files["manifest"]).read().decode()
         fields = dict(line.split("=", 1) for line in manifest.splitlines() if "=" in line)
         fields = {key.strip(): value.strip() for key, value in fields.items()}
@@ -29,7 +34,6 @@ def audit(path: Path):
             image = package.extractfile(files[name]).read()
             assert image[:8] == b"\x89PNG\r\n\x1a\n"
             assert struct.unpack("!II", image[16:24]) == (size, size)
-        assert files["cmd/main"].mode & 0o111, "Lifecycle entry is not executable"
     with tarfile.open(fileobj=io.BytesIO(payload), mode="r:gz") as app:
         files = {member.name: member for member in app.getmembers()}
         for name in ("python/bin/python3.12", "server/ptflow/__main__.py", "server/ptflow/web.py",

@@ -1,0 +1,10 @@
+#!/bin/bash
+set -euo pipefail
+if [[ "$(uname -s)" != Linux || "$(id -u)" != 0 ]]; then
+    echo "PTFlow installation requires a Linux root lifecycle" >&2
+    exit 1
+fi
+case "$(uname -m)" in
+    x86_64|aarch64|arm64) ;;
+    *) echo "PTFlow requires a supported 64-bit CPU" >&2; exit 1 ;;
+esac

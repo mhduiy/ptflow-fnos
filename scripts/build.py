@@ -52,7 +52,7 @@ def write_tar(source: Path, destination: Path):
         return info
 
     with destination.open("wb") as output, gzip.GzipFile(filename="", fileobj=output, mode="wb", mtime=epoch) as compressed:
-        with tarfile.open(fileobj=compressed, mode="w", format=tarfile.GNU_FORMAT) as archive:
+        with tarfile.open(fileobj=compressed, mode="w") as archive:
             for child in sorted(source.iterdir()):
                 archive.add(child, arcname=child.name, filter=normalize)
 
